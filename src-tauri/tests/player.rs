@@ -1072,3 +1072,198 @@ fn seeks_and_stops_reach_the_window_like_other_state_changes() {
     assert!(!stopped.playing);
     assert_eq!(stopped.position_ms, 0);
 }
+
+/// Writes a deterministic 16-bit PCM WAV, so volume and seek tests can assert
+/// on real non-zero samples at the sink instead of the all-zero silence
+/// fixtures. `samples` is interleaved and must match `channels`.
+fn wav_file(directory: &Path, name: &str, sample_rate: u32, channels: u16, samples: &[i16]) -> PathBuf {
+    fs::create_dir_all(directory).unwrap();
+    let path = directory.join(format!("{name}.wav"));
+    let data_bytes = (samples.len() * 2) as u32;
+    let block_align = channels * 2;
+    let mut bytes = Vec::with_capacity(44 + data_bytes as usize);
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+    bytes.extend_from_slice(b"WAVE");
+    bytes.extend_from_slice(b"fmt ");
+    bytes.extend_from_slice(&16_u32.to_le_bytes());
+    bytes.extend_from_slice(&1_u16.to_le_bytes()); // PCM
+    bytes.extend_from_slice(&channels.to_le_bytes());
+    bytes.extend_from_slice(&sample_rate.to_le_bytes());
+    bytes.extend_from_slice(&(sample_rate * u32::from(block_align)).to_le_bytes());
+    bytes.extend_from_slice(&block_align.to_le_bytes());
+    bytes.extend_from_slice(&16_u16.to_le_bytes()); // bits per sample
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&data_bytes.to_le_bytes());
+    for sample in samples {
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    fs::write(&path, bytes).unwrap();
+    path
+}
+
+/// PCM 8192 decodes to exactly 0.25 in f32 (8192 / 32768), so volume
+/// assertions below are exact bit comparisons, not approximations.
+const QUARTER: f32 = 0.25;
+
+fn tone_entry(path: PathBuf, title: &str, duration_ms: u64) -> QueueEntry {
+    QueueEntry {
+        duration_ms,
+        ..entry(path, title)
+    }
+}
+
+#[test]
+fn volume_scales_the_written_samples_and_zero_volume_keeps_the_stream_alive() {
+    let temp = TempDir::new().unwrap();
+    let album = temp.path().join("Album");
+    // Two seconds of a constant tone, longer than any single pull below.
+    let tone = wav_file(&album, "tone", 44_100, 2, &vec![8192; 44_100 * 2 * 2]);
+    let sink = FakeOutputSink::new(44_100, 2);
+    let player = Player::open(temp.path().join("library.db"), sink.clone()).unwrap();
+    assert_eq!(
+        player.snapshot().volume,
+        0.8,
+        "a fresh player starts at a sensible default volume"
+    );
+    player
+        .play_entries(vec![tone_entry(tone.clone(), "Tone", 2_000)], &tone)
+        .unwrap();
+    player.set_volume(1.0);
+
+    let full = sink.pull(500);
+    assert!(
+        full.iter().all(|sample| *sample == QUARTER),
+        "full volume writes the decoded samples unchanged"
+    );
+
+    let half = player.set_volume(0.5);
+    assert_eq!(half.volume, 0.5);
+    let halved = sink.pull(500);
+    assert!(
+        halved.iter().all(|sample| *sample == QUARTER * 0.5),
+        "half volume writes half-magnitude samples"
+    );
+
+    let muted = player.set_volume(0.0);
+    assert_eq!(muted.volume, 0.0);
+    let silence = sink.pull(500);
+    assert!(
+        silence.iter().all(|sample| *sample == 0.0),
+        "zero volume writes silence"
+    );
+    assert_eq!(
+        sink.starts(),
+        1,
+        "the stream was never closed or reopened at zero volume"
+    );
+    assert!(
+        player.snapshot().playing,
+        "playback continues while the volume is zero"
+    );
+
+    player.set_volume(0.5);
+    let unmuted = sink.pull(500);
+    assert!(
+        unmuted.iter().all(|sample| *sample == QUARTER * 0.5),
+        "raising the volume again restores the samples immediately"
+    );
+}
+
+#[test]
+fn volume_is_clamped_to_the_zero_to_one_range() {
+    let temp = TempDir::new().unwrap();
+    let player = Player::open(
+        temp.path().join("library.db"),
+        NoDeviceOutputSink {
+            sample_rate: 48_000,
+            channels: 2,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(player.set_volume(1.4).volume, 1.0);
+    assert_eq!(player.set_volume(-0.2).volume, 0.0);
+}
+
+#[test]
+fn a_seek_moves_the_decode_position_at_the_sink() {
+    let temp = TempDir::new().unwrap();
+    let album = temp.path().join("Album");
+    // One quiet second followed by three loud seconds, so the sink can tell
+    // which part of the file is being decoded.
+    let mut samples = vec![8192_i16; 44_100 * 2];
+    samples.extend(std::iter::repeat_n(16_384_i16, 44_100 * 2 * 3));
+    let tone = wav_file(&album, "steps", 44_100, 2, &samples);
+    let sink = FakeOutputSink::new(44_100, 2);
+    let player = Player::open(temp.path().join("library.db"), sink.clone()).unwrap();
+    player
+        .play_entries(vec![tone_entry(tone.clone(), "Steps", 4_000)], &tone)
+        .unwrap();
+    player.set_volume(1.0);
+
+    let heard = sink.pull(250);
+    assert!(heard.iter().all(|sample| *sample == QUARTER));
+
+    player.seek_to_ms(2_000);
+    let jumped = sink.pull(250);
+    assert!(
+        jumped.iter().all(|sample| *sample == 0.5),
+        "after the seek the sink receives samples decoded from the new position"
+    );
+    assert_eq!(
+        sink.starts(),
+        1,
+        "the seek discarded buffered audio inside the same open stream"
+    );
+}
+
+#[test]
+fn position_events_reach_the_window_a_few_times_per_second_and_stop_on_pause() {
+    let temp = TempDir::new().unwrap();
+    let album = temp.path().join("Album");
+    let tone = wav_file(&album, "tone", 44_100, 2, &vec![8192; 44_100 * 2 * 4]);
+    let sink = FakeOutputSink::new(44_100, 2);
+    let player = Player::open(temp.path().join("library.db"), sink.clone()).unwrap();
+    let (events, receive) = std::sync::mpsc::channel();
+    player.set_event_handler(move |snapshot| {
+        let _ = events.send(snapshot);
+    });
+    player
+        .play_entries(vec![tone_entry(tone.clone(), "Tone", 4_000)], &tone)
+        .unwrap();
+    receive
+        .recv_timeout(Duration::from_secs(5))
+        .expect("starting playback reaches the window");
+
+    // Play 1.2 seconds in 100 ms pulls, the way a live device would ask.
+    for _ in 0..12 {
+        sink.pull(4_410);
+    }
+    let mut positions = Vec::new();
+    while let Ok(snapshot) = receive.try_recv() {
+        positions.push(snapshot.position_ms);
+    }
+    assert!(
+        (3..=6).contains(&positions.len()),
+        "1.2 seconds of playback emitted {} position events, expected a few per second",
+        positions.len()
+    );
+    assert!(
+        positions.windows(2).all(|pair| pair[1] > pair[0]),
+        "each event reports a further position: {positions:?}"
+    );
+
+    player.pause();
+    receive
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the pause itself reaches the window");
+    for _ in 0..12 {
+        sink.pull(4_410);
+    }
+    assert!(
+        receive.try_recv().is_err(),
+        "a paused player emits no position events even though silence flows"
+    );
+    assert_eq!(sink.pulls(), 24, "every pull still reached the sink");
+}
