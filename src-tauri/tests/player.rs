@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use linkamp_lib::library::{LibraryIndex, Track};
 use linkamp_lib::player::{FakeOutputSink, NoDeviceOutputSink, Player, QueueEntry};
+use std::time::Duration;
 use tempfile::TempDir;
 
 fn fixture(extension: &str) -> PathBuf {
@@ -25,6 +26,15 @@ fn entry(path: PathBuf, title: &str) -> QueueEntry {
         artist: Some("Test Artist".to_owned()),
         album: "Test Album".to_owned(),
         duration_ms: 150,
+    }
+}
+
+/// An entry whose tagged duration runs far past the fixture's real audio, so
+/// a seek clamped to the tag still lands beyond the end of the stream.
+fn long_entry(path: PathBuf, title: &str) -> QueueEntry {
+    QueueEntry {
+        duration_ms: 5_000,
+        ..entry(path, title)
     }
 }
 
@@ -215,4 +225,206 @@ fn a_library_rescan_does_not_rebuild_or_stop_the_live_queue() {
     assert_eq!(after.queue, before.queue);
     assert_eq!(after.current_index, before.current_index);
     assert!(after.playing);
+}
+
+/// Elapsed milliseconds the player reports after `frames` frames at 44.1 kHz,
+/// the same arithmetic the player uses.
+fn elapsed_ms(frames: u64) -> u64 {
+    frames * 1_000 / 44_100
+}
+
+#[test]
+fn position_advances_with_playback_and_a_pause_freezes_it() {
+    let temp = TempDir::new().unwrap();
+    let album = temp.path().join("Album");
+    let one = audio_file(&album, "one", "mp3");
+    let sink = FakeOutputSink::new(44_100, 2);
+    let player = Player::open(temp.path().join("library.db"), sink.clone()).unwrap();
+    player
+        .play_entries(vec![entry(one, "One")], &album.join("one.mp3"))
+        .unwrap();
+
+    sink.pull(1_000);
+    assert_eq!(player.snapshot().position_ms, elapsed_ms(1_000));
+
+    player.pause();
+    sink.pull(2_000);
+    assert_eq!(
+        player.snapshot().position_ms,
+        elapsed_ms(1_000),
+        "silence written during a pause does not move the position"
+    );
+
+    player.play();
+    sink.pull(500);
+    assert_eq!(player.snapshot().position_ms, elapsed_ms(1_500));
+}
+
+#[test]
+fn a_forward_seek_continues_the_same_track_from_the_new_position() {
+    let temp = TempDir::new().unwrap();
+    let album = temp.path().join("Album");
+    let one = audio_file(&album, "one", "mp3");
+    let sink = FakeOutputSink::new(44_100, 2);
+    let player = Player::open(temp.path().join("library.db"), sink.clone()).unwrap();
+    player
+        .play_entries(vec![entry(one, "One")], &album.join("one.mp3"))
+        .unwrap();
+    sink.pull(500);
+    assert_eq!(player.snapshot().position_ms, elapsed_ms(500));
+
+    // 11 ms of playback plus a 49 ms offset lands at 60 ms, inside the entry.
+    let snapshot = player.seek(49);
+
+    assert_eq!(snapshot.current_index, Some(0));
+    assert!(snapshot.playing);
+    // 60 ms is exactly 2,646 frames at 44.1 kHz, so the read-back is exact.
+    assert_eq!(snapshot.position_ms, 60);
+    sink.pull(354);
+    let resumed = player.snapshot();
+    assert_eq!(resumed.current_index, Some(0));
+    assert!(resumed.playing);
+    assert_eq!(resumed.position_ms, elapsed_ms(2_646 + 354));
+}
+
+#[test]
+fn a_rewind_seek_clamps_to_the_start_of_the_track() {
+    let temp = TempDir::new().unwrap();
+    let album = temp.path().join("Album");
+    let one = audio_file(&album, "one", "mp3");
+    let sink = FakeOutputSink::new(44_100, 2);
+    let player = Player::open(temp.path().join("library.db"), sink.clone()).unwrap();
+    player
+        .play_entries(vec![entry(one, "One")], &album.join("one.mp3"))
+        .unwrap();
+    sink.pull(2_000);
+    assert!(player.snapshot().position_ms > 0);
+
+    let snapshot = player.seek(-600_000);
+
+    assert_eq!(snapshot.current_index, Some(0));
+    assert!(snapshot.playing);
+    assert_eq!(snapshot.position_ms, 0);
+}
+
+#[test]
+fn a_seek_while_paused_moves_where_playback_resumes() {
+    let temp = TempDir::new().unwrap();
+    let album = temp.path().join("Album");
+    let one = audio_file(&album, "one", "mp3");
+    let sink = FakeOutputSink::new(44_100, 2);
+    let player = Player::open(temp.path().join("library.db"), sink.clone()).unwrap();
+    player
+        .play_entries(vec![entry(one, "One")], &album.join("one.mp3"))
+        .unwrap();
+    sink.pull(500);
+    player.pause();
+
+    let snapshot = player.seek_to_ms(50);
+
+    assert_eq!(snapshot.position_ms, 50);
+    sink.pull(1_000);
+    assert_eq!(
+        player.snapshot().position_ms,
+        50,
+        "a paused player holds the sought position"
+    );
+    player.play();
+    sink.pull(100);
+    assert_eq!(player.snapshot().position_ms, elapsed_ms(2_205 + 100));
+}
+
+#[test]
+fn a_seek_past_the_end_lands_on_the_next_track() {
+    let temp = TempDir::new().unwrap();
+    let album = temp.path().join("Album");
+    let one = audio_file(&album, "one", "mp3");
+    let two = audio_file(&album, "two", "flac");
+    let sink = FakeOutputSink::new(44_100, 2);
+    let player = Player::open(temp.path().join("library.db"), sink.clone()).unwrap();
+    player
+        .play_entries(
+            vec![long_entry(one, "One"), long_entry(two, "Two")],
+            &album.join("one.mp3"),
+        )
+        .unwrap();
+    sink.pull(100);
+    assert_eq!(player.snapshot().current_index, Some(0));
+
+    let snapshot = player.seek(3_600_000);
+
+    assert_eq!(snapshot.current_index, Some(1));
+    assert!(
+        snapshot.playing,
+        "a seek past the end acts like reaching the end of the track"
+    );
+    assert_eq!(snapshot.position_ms, 0);
+    sink.pull(200);
+    assert_eq!(player.snapshot().position_ms, elapsed_ms(200));
+}
+
+#[test]
+fn stop_resets_the_position_and_play_restarts_the_same_entry() {
+    let temp = TempDir::new().unwrap();
+    let album = temp.path().join("Album");
+    let one = audio_file(&album, "one", "mp3");
+    let sink = FakeOutputSink::new(44_100, 2);
+    let player = Player::open(temp.path().join("library.db"), sink.clone()).unwrap();
+    player
+        .play_entries(vec![entry(one, "One")], &album.join("one.mp3"))
+        .unwrap();
+    sink.pull(1_000);
+    assert!(player.snapshot().position_ms > 0);
+
+    let stopped = player.stop();
+
+    assert!(!stopped.playing);
+    assert_eq!(stopped.current_index, Some(0));
+    assert_eq!(stopped.queue.len(), 1);
+    assert_eq!(stopped.position_ms, 0);
+    sink.pull(500);
+    assert_eq!(
+        player.snapshot().position_ms,
+        0,
+        "a stopped player does not advance"
+    );
+
+    let resumed = player.play();
+    assert!(resumed.playing);
+    sink.pull(1_000);
+    assert_eq!(player.snapshot().position_ms, elapsed_ms(1_000));
+}
+
+#[test]
+fn seeks_and_stops_reach_the_window_like_other_state_changes() {
+    let temp = TempDir::new().unwrap();
+    let album = temp.path().join("Album");
+    let one = audio_file(&album, "one", "mp3");
+    let sink = FakeOutputSink::new(44_100, 2);
+    let player = Player::open(temp.path().join("library.db"), sink).unwrap();
+    let (events, receive) = std::sync::mpsc::channel();
+    player.set_event_handler(move |snapshot| {
+        let _ = events.send(snapshot);
+    });
+    player
+        .play_entries(vec![entry(one, "One")], &album.join("one.mp3"))
+        .unwrap();
+    let started = receive
+        .recv_timeout(Duration::from_secs(5))
+        .expect("starting playback reaches the window");
+    assert!(started.playing);
+
+    player.seek_to_ms(60);
+    let sought = receive
+        .recv_timeout(Duration::from_secs(5))
+        .expect("a seek reports the new position to the window");
+    assert_eq!(sought.position_ms, 60);
+    assert!(sought.playing);
+
+    player.stop();
+    let stopped = receive
+        .recv_timeout(Duration::from_secs(5))
+        .expect("a stop reports the new state to the window");
+    assert!(!stopped.playing);
+    assert_eq!(stopped.position_ms, 0);
 }

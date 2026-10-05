@@ -86,9 +86,15 @@ type PlayerSnapshot = {
   queue: QueueTrack[];
   currentIndex: number | null;
   playing: boolean;
+  positionMs: number;
 };
 
-const INITIAL_PLAYER: PlayerSnapshot = { queue: [], currentIndex: null, playing: false };
+const INITIAL_PLAYER: PlayerSnapshot = {
+  queue: [],
+  currentIndex: null,
+  playing: false,
+  positionMs: 0,
+};
 
 function emptyMessage(
   section: SectionId,
