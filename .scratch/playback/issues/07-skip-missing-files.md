@@ -6,10 +6,16 @@
 
 **Status:** ready-for-agent
 
-- [ ] Playback reaching a queued file that is gone skips to the next entry and continues
-- [ ] A missing entry keeps its title, artist, album, and duration in Now Playing
-- [ ] A missing entry is labeled Missing in the queue view
+- [x] Playback reaching a queued file that is gone skips to the next entry and continues
+- [x] A missing entry keeps its title, artist, album, and duration in Now Playing
+- [x] A missing entry is labeled Missing in the queue view
 - [ ] A restored queue after a restart skips missing entries the same way
-- [ ] A missing first or last entry of a queue is handled the same as one in the middle
-- [ ] Skipping a missing file does not count as playing it and does not touch anything on disk
-- [ ] Tests delete a fixture file after enqueueing it, then assert the skip, the surviving row, and that playback continues
+- [x] A missing first or last entry of a queue is handled the same as one in the middle
+- [x] Skipping a missing file does not count as playing it and does not touch anything on disk
+- [x] Tests delete a fixture file after enqueueing it, then assert the skip, the surviving row, and that playback continues
+
+## Comments
+
+Implemented missing-file detection from queue snapshots, automatic forward skipping without making a missing row current, and a visible **Missing** label while preserving the enqueued metadata. Added fake-sink coverage for deleted middle, first, and last entries and assertions that surviving audio remains unchanged. The restored-queue criterion remains unchecked because queue restoration belongs to ticket 06 and does not exist yet.
+
+Verification passed: `mise exec -- cargo test` ran 42 integration tests (34 library and 8 player), plus 0 unit and 0 doc tests; `corepack npm exec tsc -- --noEmit` passed.
