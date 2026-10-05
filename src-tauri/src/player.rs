@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{Decoder, DecoderOptions};
@@ -184,10 +184,21 @@ impl Core {
         let Some(entry) = self.state.queue.get(index) else {
             return false;
         };
+        // A position restored from disk must seek the freshly opened track
+        // before its first frame reaches the sink; otherwise the listener
+        // would hear the start of the entry before landing on the saved spot.
+        let start_frame = self.frames_in_current;
         match PreparedTrack::open(&entry.path, index, self.sample_rate, self.channels) {
-            Ok(track) => {
+            Ok(mut track) => {
+                if start_frame > 0 && !track.seek_to(start_frame) {
+                    eprintln!(
+                        "could not seek {} to frame {start_frame}",
+                        entry.path.display()
+                    );
+                    self.current = None;
+                    return false;
+                }
                 self.current = Some(track);
-                self.frames_in_current = 0;
                 self.prepare_upcoming();
                 true
             }
@@ -413,10 +424,13 @@ impl Core {
         changed
     }
 
+    /// Saves the original (unshuffled) queue. Shuffle is a mode over the
+    /// queue, not a rewrite, so the unshuffled order is the one that survives
+    /// a restart; the shuffled order is reconstructed on load when needed.
     fn save_queue(&mut self) -> Result<()> {
         let transaction = self.connection.transaction()?;
         transaction.execute("DELETE FROM player_queue", [])?;
-        for (position, entry) in self.state.queue.iter().enumerate() {
+        for (position, entry) in self.original_queue.iter().enumerate() {
             transaction.execute(
                 "INSERT INTO player_queue(position, path, title, artist, album, duration_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -431,6 +445,121 @@ impl Core {
             )?;
         }
         transaction.commit()?;
+        Ok(())
+    }
+
+    /// Writes the current entry, position, volume, shuffle, and repeat into
+    /// the single-row `player_state` table. The render callback calls this
+    /// each time the periodic position event fires, so a hard exit loses at
+    /// most a small chunk of the buffer; the command-side setters call it on
+    /// every change so volume, shuffle, and repeat are durable at once.
+    fn save_state(&mut self) -> Result<()> {
+        let current_index = self
+            .state
+            .current_index
+            .and_then(|index| i64::try_from(index).ok());
+        let frames = i64::try_from(self.frames_in_current).unwrap_or(i64::MAX);
+        let repeat = match self.state.repeat {
+            RepeatMode::Off => 0_i64,
+            RepeatMode::All => 1_i64,
+            RepeatMode::One => 2_i64,
+        };
+        self.connection.execute(
+            "INSERT INTO player_state(id, current_index, frames_in_current, volume, shuffle, repeat)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET
+                 current_index = excluded.current_index,
+                 frames_in_current = excluded.frames_in_current,
+                 volume = excluded.volume,
+                 shuffle = excluded.shuffle,
+                 repeat = excluded.repeat",
+            params![
+                current_index,
+                frames,
+                f64::from(self.state.volume),
+                i64::from(self.state.shuffle),
+                repeat,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Loads the queue from `player_queue` and the per-player settings from
+    /// `player_state` into `self`. The queue comes back in declared position
+    /// order with all its snapshot fields intact; settings that the previous
+    /// session did not write keep their defaults. A launch always starts
+    /// paused, so a silent restart can never surprise the listener with sound.
+    fn load_state(&mut self) -> Result<()> {
+        let queue: Vec<QueueEntry> = {
+            let mut statement = self.connection.prepare(
+                "SELECT path, title, artist, album, duration_ms FROM player_queue ORDER BY position",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok(QueueEntry {
+                        path: PathBuf::from(row.get::<_, String>(0)?),
+                        title: row.get(1)?,
+                        artist: row.get(2)?,
+                        album: row.get(3)?,
+                        duration_ms: row.get::<_, i64>(4)? as u64,
+                        missing: false,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+
+        self.original_queue = queue.clone();
+        let mut queue = queue;
+
+        let state_row: Option<(Option<i64>, i64, f64, i64, i64)> = self
+            .connection
+            .query_row(
+                "SELECT current_index, frames_in_current, volume, shuffle, repeat
+                 FROM player_state WHERE id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, f64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        if let Some((current_index, frames_in_current, volume, shuffle, repeat)) = state_row {
+            self.state.current_index = current_index
+                .and_then(|value| usize::try_from(value).ok())
+                .filter(|index| *index < queue.len());
+            // Frames are the source of truth; storing them avoids the
+            // millisecond-round-trip loss a millisecond column would have.
+            self.frames_in_current = frames_in_current.max(0) as u64;
+            self.state.volume = volume as f32;
+            self.state.shuffle = shuffle != 0;
+            self.state.repeat = match repeat {
+                1 => RepeatMode::All,
+                2 => RepeatMode::One,
+                _ => RepeatMode::Off,
+            };
+            if self.state.shuffle {
+                // Shuffle was on when the previous session ended: re-anchor
+                // the current entry and reshuffle the entries after it, the
+                // same way turning shuffle on does.
+                let split_at = self.state.current_index.map(|index| index + 1).unwrap_or(0);
+                if split_at < queue.len() {
+                    let mut tail = queue.split_off(split_at);
+                    shuffle_slice(&mut tail, &mut self.shuffle_rng);
+                    queue.extend(tail);
+                }
+            }
+        }
+
+        self.state.queue = queue;
+        // A launch never opens with the stream playing: the listener would
+        // hear whatever the saved position landed on without warning.
+        self.state.playing = false;
         Ok(())
     }
 }
@@ -458,6 +587,14 @@ impl Player {
                  artist TEXT,
                  album TEXT NOT NULL,
                  duration_ms INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS player_state (
+                 id INTEGER PRIMARY KEY CHECK (id = 1),
+                 current_index INTEGER,
+                 frames_in_current INTEGER NOT NULL,
+                 volume REAL NOT NULL,
+                 shuffle INTEGER NOT NULL,
+                 repeat INTEGER NOT NULL
              );",
         )?;
 
@@ -475,6 +612,15 @@ impl Player {
             channels,
             connection,
         }));
+        // Restore the queue, current entry, position, volume, shuffle, and
+        // repeat from the database before the render callback opens its first
+        // PreparedTrack. A launch never plays a frame, so a fresh Player
+        // always opens paused at whatever position the previous session last
+        // wrote. The loop back here drains the queue rows in declared position
+        // order, so the listener's saved order comes back intact.
+        core.lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .load_state()?;
         let event_handler: Arc<Mutex<Option<EventHandler>>> = Arc::new(Mutex::new(None));
         let render_core = Arc::clone(&core);
         let render_events = Arc::clone(&event_handler);
@@ -494,6 +640,10 @@ impl Player {
                     .abs_diff(last_reported_position_ms)
                     >= POSITION_EVENT_INTERVAL_MS;
                 if changed || (snapshot.playing && position_moved) {
+                    // The same trigger that announces a position event also
+                    // persists it, so a hard exit loses at most one chunk of
+                    // the buffer instead of the whole current entry.
+                    let _ = core.save_state();
                     last_reported_position_ms = snapshot.position_ms;
                     Some(snapshot)
                 } else {
@@ -541,6 +691,9 @@ impl Player {
             let mut core = self.core.lock().unwrap_or_else(|error| error.into_inner());
             let mut queue = entries.into_iter().skip(start).collect::<Vec<_>>();
             core.original_queue = queue.clone();
+            // The unshuffled queue is what must survive a restart; save it
+            // before any shuffle reshapes the in-memory playing queue.
+            core.save_queue()?;
             if core.state.shuffle && queue.len() > 1 {
                 let mut tail = queue.split_off(1);
                 shuffle_slice(&mut tail, &mut core.shuffle_rng);
@@ -552,8 +705,9 @@ impl Player {
             core.current = None;
             core.upcoming = None;
             core.frames_in_current = 0;
-            core.save_queue()?;
-            core.snapshot()
+            let snapshot = core.snapshot();
+            let _ = core.save_state();
+            snapshot
         };
         self.emit(snapshot.clone());
         Ok(snapshot)
@@ -565,19 +719,21 @@ impl Player {
             if !core.state.queue.is_empty() {
                 // A None current index means the queue has either never played
                 // or has just ended. Both cases start the queue from the top.
+                // When the current index is already set, the saved frames are
+                // kept verbatim so a position restored from disk lands on the
+                // exact spot they left off; open_current seeks the freshly
+                // opened PreparedTrack to that frame before its first render.
                 if core.state.current_index.is_none() {
                     core.state.current_index = Some(0);
                     core.current = None;
                     core.upcoming = None;
                     core.frames_in_current = 0;
                 }
-                if core.current.is_none() {
-                    // Nothing is decoded: the current entry starts from the top.
-                    core.frames_in_current = 0;
-                }
                 core.state.playing = true;
             }
-            core.snapshot()
+            let snapshot = core.snapshot();
+            let _ = core.save_state();
+            snapshot
         };
         self.emit(snapshot.clone());
         snapshot
@@ -587,7 +743,9 @@ impl Player {
         let snapshot = {
             let mut core = self.core.lock().unwrap_or_else(|error| error.into_inner());
             core.state.playing = false;
-            core.snapshot()
+            let snapshot = core.snapshot();
+            let _ = core.save_state();
+            snapshot
         };
         self.emit(snapshot.clone());
         snapshot
@@ -607,7 +765,9 @@ impl Player {
             let was_playing = core.state.playing;
             let advanced = core.advance();
             core.state.playing = was_playing && advanced;
-            core.snapshot()
+            let snapshot = core.snapshot();
+            let _ = core.save_state();
+            snapshot
         };
         self.emit(snapshot.clone());
         snapshot
@@ -617,7 +777,9 @@ impl Player {
         let snapshot = {
             let mut core = self.core.lock().unwrap_or_else(|error| error.into_inner());
             core.previous();
-            core.snapshot()
+            let snapshot = core.snapshot();
+            let _ = core.save_state();
+            snapshot
         };
         self.emit(snapshot.clone());
         snapshot
@@ -632,7 +794,9 @@ impl Player {
             core.current = None;
             core.upcoming = None;
             core.frames_in_current = 0;
-            core.snapshot()
+            let snapshot = core.snapshot();
+            let _ = core.save_state();
+            snapshot
         };
         self.emit(snapshot.clone());
         snapshot
@@ -646,7 +810,9 @@ impl Player {
             let current = core.frames_to_ms(core.frames_in_current) as i64;
             let target = current.saturating_add(offset_ms).max(0) as u64;
             core.seek(target);
-            core.snapshot()
+            let snapshot = core.snapshot();
+            let _ = core.save_state();
+            snapshot
         };
         self.emit(snapshot.clone());
         snapshot
@@ -658,7 +824,9 @@ impl Player {
         let snapshot = {
             let mut core = self.core.lock().unwrap_or_else(|error| error.into_inner());
             core.seek(position_ms);
-            core.snapshot()
+            let snapshot = core.snapshot();
+            let _ = core.save_state();
+            snapshot
         };
         self.emit(snapshot.clone());
         snapshot
@@ -712,7 +880,9 @@ impl Player {
                 }
                 core.state.shuffle = on;
             }
-            core.snapshot()
+            let snapshot = core.snapshot();
+            let _ = core.save_state();
+            snapshot
         };
         self.emit(snapshot.clone());
         snapshot
@@ -722,7 +892,9 @@ impl Player {
         let snapshot = {
             let mut core = self.core.lock().unwrap_or_else(|error| error.into_inner());
             core.state.repeat = mode;
-            core.snapshot()
+            let snapshot = core.snapshot();
+            let _ = core.save_state();
+            snapshot
         };
         self.emit(snapshot.clone());
         snapshot
@@ -735,10 +907,22 @@ impl Player {
         let snapshot = {
             let mut core = self.core.lock().unwrap_or_else(|error| error.into_inner());
             core.state.volume = volume.clamp(0.0, 1.0);
-            core.snapshot()
+            let snapshot = core.snapshot();
+            let _ = core.save_state();
+            snapshot
         };
         self.emit(snapshot.clone());
         snapshot
+    }
+
+    /// Forces the queue and the per-player settings out to the database. Quit
+    /// and hide-to-tray call this from the Tauri command bridge so the last
+    /// position the listener heard is what the next session restores, even if
+    /// no render callback has fired since the last change.
+    pub fn flush(&self) {
+        let mut core = self.core.lock().unwrap_or_else(|error| error.into_inner());
+        let _ = core.save_state();
+        let _ = core.save_queue();
     }
 
     #[doc(hidden)]
