@@ -58,6 +58,8 @@ pub struct QueueEntry {
     pub artist: Option<String>,
     pub album: String,
     pub duration_ms: u64,
+    #[serde(default)]
+    pub missing: bool,
 }
 
 impl From<Track> for QueueEntry {
@@ -68,6 +70,7 @@ impl From<Track> for QueueEntry {
             artist: track.artist,
             album: track.album,
             duration_ms: track.duration_ms,
+            missing: false,
         }
     }
 }
@@ -135,7 +138,11 @@ struct Core {
 
 impl Core {
     fn snapshot(&self) -> PlayerSnapshot {
-        self.state.clone()
+        let mut snapshot = self.state.clone();
+        for entry in &mut snapshot.queue {
+            entry.missing = !entry.path.is_file();
+        }
+        snapshot
     }
 
     fn open_current(&mut self) -> bool {
@@ -187,8 +194,9 @@ impl Core {
     }
 
     /// Moves to the next queue entry. An entry prepared by decode-ahead
-    /// becomes the current one without opening anything. Returns false at the
-    /// end of the queue, where playback stops and the queue stays in place.
+    /// becomes the current one without opening anything, and entries that
+    /// cannot be opened are skipped. Returns false at the end of the queue,
+    /// where playback stops and the queue stays in place.
     fn advance(&mut self) -> bool {
         if self.state.repeat == RepeatMode::One && self.state.current_index.is_some() {
             // Replay the current entry from the top.
@@ -197,33 +205,43 @@ impl Core {
             self.frames_in_current = 0;
             return self.open_current();
         }
-        let next = self.state.current_index.map_or(0, |index| index + 1);
-        if next >= self.state.queue.len() {
-            if self.state.repeat == RepeatMode::All && !self.state.queue.is_empty() {
-                // Wrap to the top of the queue.
-                self.state.current_index = Some(0);
+        let mut next = self.state.current_index.map_or(0, |index| index + 1);
+        let mut wrapped = false;
+        loop {
+            if next >= self.state.queue.len() {
+                if self.state.repeat == RepeatMode::All
+                    && !self.state.queue.is_empty()
+                    && !wrapped
+                {
+                    // Wrap to the top of the queue, once.
+                    next = 0;
+                    wrapped = true;
+                    continue;
+                }
+                // Repeat Off at the end, or every remaining entry is missing:
+                // stop with the queue in place. A None current index is the
+                // stopped sentinel; Play starts from the top.
+                self.state.playing = false;
+                self.state.current_index = None;
                 self.current = None;
                 self.upcoming = None;
                 self.frames_in_current = 0;
-                return self.open_current();
+                return false;
             }
-            // Repeat Off at the end: stop with the queue in place. A None
-            // current index is the stopped sentinel; Play starts from the top.
-            self.state.playing = false;
-            self.state.current_index = None;
-            self.current = None;
-            self.upcoming = None;
+            let prepared = self
+                .upcoming
+                .take()
+                .filter(|track| track.queue_index == next);
+            self.state.current_index = Some(next);
+            self.current = prepared;
             self.frames_in_current = 0;
-            return false;
+            if self.current.is_some() || self.open_current() {
+                self.prepare_upcoming();
+                return true;
+            }
+            // A missing or unreadable entry is skipped.
+            next += 1;
         }
-        self.state.current_index = Some(next);
-        self.current = self
-            .upcoming
-            .take()
-            .filter(|track| track.queue_index == next);
-        self.frames_in_current = 0;
-        self.prepare_upcoming();
-        true
     }
 
     fn previous(&mut self) {

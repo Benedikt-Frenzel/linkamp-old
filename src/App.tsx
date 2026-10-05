@@ -80,7 +80,9 @@ const INITIAL_LIBRARY: LibrarySnapshot = {
 
 const UNKNOWN_KEY = "\0unknown";
 
-type QueueTrack = Pick<Track, "path" | "title" | "artist" | "album" | "durationMs">;
+type QueueTrack = Pick<Track, "path" | "title" | "artist" | "album" | "durationMs"> & {
+  missing?: boolean;
+};
 
 type RepeatMode = "off" | "all" | "one";
 
@@ -197,7 +199,7 @@ function VirtualTrackList({
             return (
               <button
                 type="button"
-                className={`track-row${selected ? " selected" : ""}${current ? " current" : ""}`}
+                className={`track-row${selected ? " selected" : ""}${current ? " current" : ""}${track.missing ? " missing" : ""}`}
                 key={track.path}
                 role="row"
                 aria-rowindex={index + 1}
@@ -207,7 +209,10 @@ function VirtualTrackList({
                 onClick={() => onSelect(track.path)}
                 onDoubleClick={() => onActivate(track.path)}
               >
-                <span role="cell" title={track.title}>{track.title}</span>
+                <span role="cell" title={track.title}>
+                  {track.title}
+                  {track.missing ? <small className="missing-label">Missing</small> : null}
+                </span>
                 <span role="cell" title={track.artist ?? "Unknown"}>{track.artist ?? "Unknown"}</span>
                 <span role="cell" title={track.album}>{track.album}</span>
                 <span role="cell" className="track-duration">{formatDuration(track.durationMs)}</span>
