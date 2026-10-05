@@ -121,6 +121,16 @@ async fn serve_on_bus(app: &AppHandle, player: &Arc<Player>) -> mpris_server::zb
             player.seek(offset.as_micros() / 1_000);
         });
     }
+    // The XFCE volume plugin drives Linkamp's own app volume through this,
+    // the same multiplier the window's slider sets. The system volume is
+    // never touched. A negative volume clamps to zero inside the player, as
+    // the MPRIS rules require.
+    {
+        let player = Arc::clone(player);
+        bus.connect_set_volume(move |_, volume| {
+            player.set_volume(volume as f32);
+        });
+    }
     // SetPosition carries the track id the bus last advertised; a stale id
     // from an earlier track is ignored, as the MPRIS rules require.
     let advertised = Rc::new(RefCell::new(TrackId::NO_TRACK));
@@ -151,6 +161,7 @@ struct ReportedState {
     status: Option<PlaybackStatus>,
     track: Option<String>,
     position_ms: u64,
+    volume: Option<f64>,
 }
 
 impl ReportedState {
@@ -208,6 +219,14 @@ impl ReportedState {
         self.position_ms = position_ms;
         // Position is polled, never announced as a property change.
         bus.set_position(Time::from_millis(position_ms as i64));
+
+        // The bus mirrors the app volume, so the desktop's volume control
+        // shows and changes the same multiplier the window's slider does.
+        let volume = f64::from(snapshot.volume);
+        if self.volume != Some(volume) {
+            bus.set_volume(volume).await?;
+            self.volume = Some(volume);
+        }
         Ok(())
     }
 }
