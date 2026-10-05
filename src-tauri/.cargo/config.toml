@@ -1,0 +1,4 @@
+# Debian runtime images carry libasound.so.2 even when the development
+# pkg-config file is absent. This metadata also works in the pinned CI image.
+[env]
+PKG_CONFIG_PATH = { value = "pkgconfig", relative = true, force = false }

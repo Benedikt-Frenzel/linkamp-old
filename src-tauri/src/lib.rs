@@ -1,4 +1,5 @@
 pub mod library;
+pub mod player;
 
 use std::fs;
 use std::path::PathBuf;
@@ -8,6 +9,7 @@ use std::time::Duration;
 use library::{AlbumCover, LibraryIndex, LibrarySnapshot, Track};
 use notify::event::ModifyKind;
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use player::{Player, PlayerSnapshot, QueueEntry};
 use serde::{Deserialize, Serialize};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -291,6 +293,47 @@ fn album_cover(
     index.album_cover(&album_id).map_err(|err| err.to_string())
 }
 
+#[tauri::command]
+fn player_snapshot(player: State<'_, Arc<Player>>) -> PlayerSnapshot {
+    player.snapshot()
+}
+
+#[tauri::command]
+fn play_tracks(
+    player: State<'_, Arc<Player>>,
+    tracks: Vec<QueueEntry>,
+    start_path: PathBuf,
+) -> Result<PlayerSnapshot, String> {
+    player
+        .play_entries(tracks, &start_path)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn player_play(player: State<'_, Arc<Player>>) -> PlayerSnapshot {
+    player.play()
+}
+
+#[tauri::command]
+fn player_pause(player: State<'_, Arc<Player>>) -> PlayerSnapshot {
+    player.pause()
+}
+
+#[tauri::command]
+fn player_toggle(player: State<'_, Arc<Player>>) -> PlayerSnapshot {
+    player.toggle()
+}
+
+#[tauri::command]
+fn player_next(player: State<'_, Arc<Player>>) -> PlayerSnapshot {
+    player.next()
+}
+
+#[tauri::command]
+fn player_previous(player: State<'_, Arc<Player>>) -> PlayerSnapshot {
+    player.previous()
+}
+
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_window_state::Builder::default().build())
@@ -312,7 +355,14 @@ pub fn run() {
             genre_tracks,
             year_tracks,
             search_tracks,
-            album_cover
+            album_cover,
+            player_snapshot,
+            play_tracks,
+            player_play,
+            player_pause,
+            player_toggle,
+            player_next,
+            player_previous
         ])
         .setup(|app| {
             let data_directory = app.path().app_data_dir()?;
@@ -331,6 +381,22 @@ pub fn run() {
                 })?,
             );
             app.manage(Arc::clone(&library));
+
+            let player = Arc::new(
+                Player::open(
+                    data_directory.join("library.db"),
+                    player::system_output_sink(),
+                )
+                .map_err(|error| {
+                    std::io::Error::other(format!("failed to open player: {error}"))
+                })?,
+            );
+            let player_events = app.handle().clone();
+            player.set_event_handler(move |snapshot| {
+                let _ = player_events.emit("player-changed", snapshot);
+            });
+            app.manage(Arc::clone(&player));
+
             let watch = start_library_watcher(Arc::clone(&library), app.handle().clone());
             app.manage(watch);
             scan_library_in_background(Arc::clone(&library), app.handle().clone());
@@ -359,7 +425,23 @@ pub fn run() {
                     "show" => show_main(app),
                     "quit" => app.exit(0),
                     "play" | "pause" | "next" | "previous" => {
-                        let _ = app.emit("transport", event.id.as_ref());
+                        if let Some(player) = app.try_state::<Arc<Player>>() {
+                            match event.id.as_ref() {
+                                "play" => {
+                                    let _ = player.play();
+                                }
+                                "pause" => {
+                                    player.pause();
+                                }
+                                "next" => {
+                                    let _ = player.next();
+                                }
+                                "previous" => {
+                                    let _ = player.previous();
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                     _ => {}
                 })
