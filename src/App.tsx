@@ -93,6 +93,7 @@ type PlayerSnapshot = {
   shuffle: boolean;
   repeat: RepeatMode;
   positionMs: number;
+  volume: number;
 };
 
 const INITIAL_PLAYER: PlayerSnapshot = {
@@ -102,7 +103,11 @@ const INITIAL_PLAYER: PlayerSnapshot = {
   shuffle: false,
   repeat: "off",
   positionMs: 0,
+  volume: 0.8,
 };
+
+const SEEK_STEP_MS = 5_000;
+const VOLUME_STEP = 0.05;
 
 const NEXT_REPEAT: Record<RepeatMode, RepeatMode> = {
   off: "all",
@@ -245,6 +250,8 @@ export function App() {
   const [watchedFolders, setWatchedFolders] = useState<string[]>([]);
   const [preferencesError, setPreferencesError] = useState<string | null>(null);
   const [changingFolders, setChangingFolders] = useState(false);
+  const [seekDragMs, setSeekDragMs] = useState<number | null>(null);
+  const seekDragRef = useRef<number | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const trackRequest = useRef(0);
@@ -370,8 +377,15 @@ export function App() {
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
       const target = event.target;
+      // Only text entry suppresses the transport keys; a focused slider or
+      // button must not swallow them, so Left and Right still seek and Up and
+      // Down still change the volume.
       const typing =
-        target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement;
+        target instanceof HTMLTextAreaElement ||
+        (target instanceof HTMLInputElement &&
+          target.type !== "range" &&
+          target.type !== "checkbox" &&
+          target.type !== "button");
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "f") {
         event.preventDefault();
         searchRef.current?.focus();
@@ -391,6 +405,18 @@ export function App() {
       } else if (event.ctrlKey && event.key === "ArrowLeft") {
         event.preventDefault();
         void runPlayerCommand("player_previous");
+      } else if (event.key === "ArrowRight") {
+        event.preventDefault();
+        void runPlayerCommand("player_seek", { offsetMs: SEEK_STEP_MS });
+      } else if (event.key === "ArrowLeft") {
+        event.preventDefault();
+        void runPlayerCommand("player_seek", { offsetMs: -SEEK_STEP_MS });
+      } else if (event.key === "ArrowUp") {
+        event.preventDefault();
+        void changeVolume(VOLUME_STEP);
+      } else if (event.key === "ArrowDown") {
+        event.preventDefault();
+        void changeVolume(-VOLUME_STEP);
       } else if (event.key.toLowerCase() === "v") {
         setPresetView((value) => !value);
       } else if (event.key.toLowerCase() === "f") {
@@ -402,7 +428,7 @@ export function App() {
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [selectedTrackPath, section, query, player.queue, tracks]);
+  }, [selectedTrackPath, section, query, player.queue, player.volume, tracks]);
 
   useEffect(() => {
     function onPointerDown(event: MouseEvent) {
@@ -410,6 +436,23 @@ export function App() {
     }
     window.addEventListener("pointerdown", onPointerDown);
     return () => window.removeEventListener("pointerdown", onPointerDown);
+  }, []);
+
+  useEffect(() => {
+    seekDragRef.current = seekDragMs;
+  }, [seekDragMs]);
+
+  // A seek-bar drag commits on pointer release wherever it happens, so the
+  // pointer leaving the slider mid-drag does not lose the drop position.
+  useEffect(() => {
+    function onPointerUp() {
+      if (seekDragRef.current !== null) {
+        void seekTo(seekDragRef.current);
+        setSeekDragMs(null);
+      }
+    }
+    window.addEventListener("pointerup", onPointerUp);
+    return () => window.removeEventListener("pointerup", onPointerUp);
   }, []);
 
   async function toggleAlwaysOnTop() {
@@ -465,12 +508,32 @@ export function App() {
     }
   }
 
-  async function runPlayerCommand(command: string) {
+  async function runPlayerCommand(command: string, args?: Record<string, unknown>) {
     try {
-      setPlayer(await invoke<PlayerSnapshot>(command));
+      setPlayer(await invoke<PlayerSnapshot>(command, args));
     } catch {
       // A missing device or unreadable file must not make the window unusable.
     }
+  }
+
+  async function seekTo(positionMs: number) {
+    try {
+      setPlayer(await invoke<PlayerSnapshot>("player_seek_to", { positionMs }));
+    } catch {
+      // Keep the window responsive if the player refuses the seek.
+    }
+  }
+
+  async function setVolumeLevel(volume: number) {
+    try {
+      setPlayer(await invoke<PlayerSnapshot>("player_set_volume", { volume }));
+    } catch {
+      // Keep the window responsive if the player refuses the change.
+    }
+  }
+
+  async function changeVolume(delta: number) {
+    await setVolumeLevel(Math.min(1, Math.max(0, player.volume + delta)));
   }
 
   async function toggleShuffle() {
@@ -541,7 +604,10 @@ export function App() {
   const isSearching = trimmedQuery.length > 0;
   const nowPlayingTracks = section === "now-playing" && !isSearching;
   const visibleTracks: QueueTrack[] = nowPlayingTracks ? player.queue : tracks;
-  const currentPath = player.currentIndex === null ? null : player.queue[player.currentIndex]?.path ?? null;
+  const currentEntry = player.currentIndex === null ? null : player.queue[player.currentIndex] ?? null;
+  const currentPath = currentEntry?.path ?? null;
+  const currentDurationMs = currentEntry?.durationMs ?? 0;
+  const shownPositionMs = seekDragMs ?? Math.min(player.positionMs, currentDurationMs);
   const entryCount =
     section === "albums"
       ? library.albums.length
@@ -638,17 +704,44 @@ export function App() {
           </button>
         </div>
 
-        <div className="seek" aria-hidden="true">
-          <span className="time">0:00</span>
-          <span className="bar" />
-          <span className="time">0:00</span>
+        <div className="seek">
+          <span className="time">{formatDuration(shownPositionMs)}</span>
+          <input
+            type="range"
+            className="seek-bar"
+            min={0}
+            max={Math.max(currentDurationMs, 1)}
+            step={1}
+            value={shownPositionMs}
+            disabled={currentEntry === null}
+            aria-label="Seek"
+            onPointerDown={() => setSeekDragMs(shownPositionMs)}
+            onChange={(event) => {
+              const ms = Number(event.currentTarget.value);
+              if (seekDragMs === null) {
+                // Not a pointer drag (a keyboard change, for instance):
+                // commit at once.
+                void seekTo(ms);
+              } else {
+                setSeekDragMs(ms);
+              }
+            }}
+          />
+          <span className="time">{formatDuration(currentDurationMs)}</span>
         </div>
 
         <canvas className="spectrum" width={96} height={28} aria-hidden="true" />
 
         <label className="volume">
           Volume
-          <input type="range" min={0} max={100} defaultValue={80} aria-label="Volume" />
+          <input
+            type="range"
+            min={0}
+            max={100}
+            value={Math.round(player.volume * 100)}
+            aria-label="Volume"
+            onChange={(event) => void setVolumeLevel(Number(event.currentTarget.value) / 100)}
+          />
         </label>
       </header>
 

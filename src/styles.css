@@ -139,11 +139,11 @@ button {
   font-size: 12px;
 }
 
-.bar {
+.seek-bar {
   flex: 1;
+  min-width: 0;
   height: 4px;
-  border-radius: 999px;
-  background: #333;
+  accent-color: var(--accent);
 }
 
 .spectrum {
