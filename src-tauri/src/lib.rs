@@ -77,6 +77,11 @@ fn always_on_top(app: tauri::AppHandle) -> bool {
 
 #[tauri::command]
 fn quit(app: tauri::AppHandle) {
+    // Persist the listener's last-known position and modes before the process
+    // ends, so the next launch opens the queue paused at the same spot.
+    if let Some(player) = app.try_state::<Arc<Player>>() {
+        player.flush();
+    }
     app.exit(0);
 }
 
@@ -465,7 +470,15 @@ pub fn run() {
                 .tooltip("Linkamp")
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "show" => show_main(app),
-                    "quit" => app.exit(0),
+                    "quit" => {
+                        // The tray Quit is the same as the menu Quit: persist
+                        // the current state so the next launch resumes from
+                        // the same place.
+                        if let Some(player) = app.try_state::<Arc<Player>>() {
+                            player.flush();
+                        }
+                        app.exit(0);
+                    }
                     "play" | "pause" | "next" | "previous" => {
                         if let Some(player) = app.try_state::<Arc<Player>>() {
                             match event.id.as_ref() {
@@ -503,6 +516,13 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
+                // Hide-to-tray keeps the music alive; flush the player
+                // state so the last heard position is what the next launch
+                // restores, even if the render callback has not fired since
+                // the last change.
+                if let Some(player) = window.app_handle().try_state::<Arc<Player>>() {
+                    player.flush();
+                }
                 let _ = window.hide();
             }
         })
