@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fmt;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -89,9 +90,16 @@ impl Default for PlayerSnapshot {
     }
 }
 
+/// Seconds of the next queue entry kept decoded and converted to the stream
+/// format, so a track transition never waits on the disk or a decoder. Bounded
+/// to a few seconds of audio, never whole files, so memory stays flat no
+/// matter how long the queue is.
+const DECODE_AHEAD_SECONDS: usize = 3;
+
 struct Core {
     state: PlayerSnapshot,
-    decoder: Option<AudioDecoder>,
+    current: Option<PreparedTrack>,
+    upcoming: Option<PreparedTrack>,
     sample_rate: u32,
     channels: usize,
     connection: Connection,
@@ -109,49 +117,88 @@ impl Core {
         let Some(entry) = self.state.queue.get(index) else {
             return false;
         };
-        match AudioDecoder::open(&entry.path, self.sample_rate) {
-            Ok(decoder) => {
-                self.decoder = Some(decoder);
+        match PreparedTrack::open(&entry.path, index, self.sample_rate, self.channels) {
+            Ok(track) => {
+                self.current = Some(track);
+                self.prepare_upcoming();
                 true
             }
             Err(error) => {
                 eprintln!("could not decode {}: {error}", entry.path.display());
-                self.decoder = None;
+                self.current = None;
                 false
             }
         }
     }
 
-    fn next(&mut self) -> bool {
+    /// Opens the entry after the current one ahead of time, so crossing the
+    /// track boundary costs nothing at the boundary itself.
+    fn prepare_upcoming(&mut self) {
+        let Some(index) = self.state.current_index else {
+            self.upcoming = None;
+            return;
+        };
+        let upcoming_index = index + 1;
+        if self
+            .upcoming
+            .as_ref()
+            .is_some_and(|track| track.queue_index == upcoming_index)
+        {
+            return;
+        }
+        self.upcoming = None;
+        let Some(entry) = self.state.queue.get(upcoming_index) else {
+            return;
+        };
+        match PreparedTrack::open(&entry.path, upcoming_index, self.sample_rate, self.channels) {
+            Ok(track) => self.upcoming = Some(track),
+            // A failed prepare is retried when the boundary is reached.
+            Err(error) => eprintln!("could not prepare {}: {error}", entry.path.display()),
+        }
+    }
+
+    /// Moves to the next queue entry. An entry prepared by decode-ahead
+    /// becomes the current one without opening anything. Returns false at the
+    /// end of the queue, where playback stops and the queue stays in place.
+    fn advance(&mut self) -> bool {
         let next = self.state.current_index.map_or(0, |index| index + 1);
         if next >= self.state.queue.len() {
             self.state.playing = false;
-            self.decoder = None;
+            self.current = None;
+            self.upcoming = None;
             return false;
         }
         self.state.current_index = Some(next);
-        self.decoder = None;
-        self.open_current()
+        self.current = self
+            .upcoming
+            .take()
+            .filter(|track| track.queue_index == next);
+        self.prepare_upcoming();
+        true
     }
 
     fn previous(&mut self) {
+        if self.state.queue.is_empty() {
+            self.state.current_index = None;
+            self.state.playing = false;
+            self.current = None;
+            self.upcoming = None;
+            return;
+        }
         let previous = self
             .state
             .current_index
             .map_or(0, |index| index.saturating_sub(1));
-        if self.state.queue.is_empty() {
-            self.state.current_index = None;
-            self.state.playing = false;
-        } else {
-            self.state.current_index = Some(previous);
-            self.decoder = None;
-            if self.state.playing {
-                self.open_current();
-            }
+        self.state.current_index = Some(previous);
+        self.current = None;
+        self.upcoming = None;
+        if self.state.playing {
+            self.open_current();
         }
     }
 
     fn render(&mut self, output: &mut [f32]) -> bool {
+        // Pause and an empty queue both feed silence into the open stream.
         output.fill(0.0);
         if !self.state.playing || self.state.queue.is_empty() {
             return false;
@@ -160,24 +207,44 @@ impl Core {
         let mut changed = false;
         let mut cursor = 0;
         while cursor + self.channels <= output.len() && self.state.playing {
-            if self.decoder.is_none() && !self.open_current() {
-                if !self.next() {
-                    changed = true;
+            if self.current.is_none() && !self.open_current() {
+                // An entry that will not decode is skipped.
+                changed = true;
+                if !self.advance() {
                     break;
                 }
+                continue;
+            }
+            if self
+                .current
+                .as_ref()
+                .is_some_and(PreparedTrack::drained)
+            {
+                // The current index moves only when the next entry's first
+                // frame is written, so the boundary is sample-exact and the
+                // stream is never closed, paused, or reopened in between.
+                self.current = None;
                 changed = true;
+                if !self.advance() {
+                    break;
+                }
                 continue;
             }
 
-            let wrote_frame = self.decoder.as_mut().is_some_and(|decoder| {
-                decoder.write_frame(&mut output[cursor..cursor + self.channels])
-            });
-            if wrote_frame {
-                cursor += self.channels;
-            } else {
-                self.decoder = None;
-                self.next();
-                changed = true;
+            let wrote = self
+                .current
+                .as_mut()
+                .map_or(0, |track| track.write_frames(&mut output[cursor..]));
+            cursor += wrote;
+        }
+
+        // Top up decode-ahead while the current track plays, so the next entry
+        // is decoded before it is needed. Paused rendering returns above and
+        // leaves both decoders untouched, which makes resume sample-exact.
+        if self.state.playing {
+            let ahead_frames = self.sample_rate as usize * DECODE_AHEAD_SECONDS;
+            if let Some(track) = self.upcoming.as_mut() {
+                track.fill(ahead_frames);
             }
         }
         changed
@@ -235,7 +302,8 @@ impl Player {
         let channels = sink.channels().max(1);
         let core = Arc::new(Mutex::new(Core {
             state: PlayerSnapshot::default(),
-            decoder: None,
+            current: None,
+            upcoming: None,
             sample_rate,
             channels,
             connection,
@@ -292,7 +360,8 @@ impl Player {
             core.state.queue = entries.into_iter().skip(start).collect();
             core.state.current_index = (!core.state.queue.is_empty()).then_some(0);
             core.state.playing = !core.state.queue.is_empty();
-            core.decoder = None;
+            core.current = None;
+            core.upcoming = None;
             core.save_queue()?;
             core.snapshot()
         };
@@ -306,7 +375,8 @@ impl Player {
             if !core.state.queue.is_empty() {
                 if core.state.current_index.is_none() {
                     core.state.current_index = Some(0);
-                    core.decoder = None;
+                    core.current = None;
+                    core.upcoming = None;
                 }
                 core.state.playing = true;
             }
@@ -338,8 +408,8 @@ impl Player {
         let snapshot = {
             let mut core = self.core.lock().unwrap_or_else(|error| error.into_inner());
             let was_playing = core.state.playing;
-            core.next();
-            core.state.playing = was_playing && core.state.current_index.is_some();
+            let advanced = core.advance();
+            core.state.playing = was_playing && advanced;
             core.snapshot()
         };
         self.emit(snapshot.clone());
@@ -378,20 +448,16 @@ fn emit_to(handler: &Mutex<Option<EventHandler>>, snapshot: PlayerSnapshot) {
     }
 }
 
-struct AudioDecoder {
+/// Symphonia decoding of one file into interleaved f32 samples in the file's
+/// own channel layout and sample rate. The mixer converts from there.
+struct TrackSource {
     format: Box<dyn FormatReader>,
     decoder: Box<dyn Decoder>,
     track_id: u32,
-    decoded: Vec<f32>,
-    cursor: usize,
-    source_channels: usize,
-    source_rate: u32,
-    output_rate: u32,
-    rate_position: f64,
 }
 
-impl AudioDecoder {
-    fn open(path: &Path, output_rate: u32) -> std::result::Result<Self, SymphoniaError> {
+impl TrackSource {
+    fn open(path: &Path) -> std::result::Result<Self, SymphoniaError> {
         let file = File::open(path).map_err(SymphoniaError::IoError)?;
         let stream = MediaSourceStream::new(Box::new(file), Default::default());
         let mut hint = Hint::new();
@@ -415,67 +481,200 @@ impl AudioDecoder {
             format,
             decoder,
             track_id,
-            decoded: Vec::new(),
-            cursor: 0,
-            source_channels: 0,
-            source_rate: output_rate,
-            output_rate,
-            rate_position: 0.0,
         })
     }
 
-    fn decode_packet(&mut self) -> bool {
+    /// Decodes one packet into `samples` as interleaved f32 and reports the
+    /// channel count and sample rate. Returns None at the end of the stream.
+    fn decode_packet_into(&mut self, samples: &mut Vec<f32>) -> Option<(usize, u32)> {
         loop {
-            let packet = match self.format.next_packet() {
-                Ok(packet) => packet,
-                Err(_) => return false,
-            };
+            let packet = self.format.next_packet().ok()?;
             if packet.track_id() != self.track_id {
                 continue;
             }
             match self.decoder.decode(&packet) {
                 Ok(audio) => {
-                    self.source_channels = audio.spec().channels.count();
-                    self.source_rate = audio.spec().rate;
-                    let mut buffer =
-                        SampleBuffer::<f32>::new(audio.capacity() as u64, *audio.spec());
+                    let spec = *audio.spec();
+                    let mut buffer = SampleBuffer::<f32>::new(audio.capacity() as u64, spec);
                     buffer.copy_interleaved_ref(audio);
-                    self.decoded.clear();
-                    self.decoded.extend_from_slice(buffer.samples());
-                    self.cursor = 0;
-                    if !self.decoded.is_empty() {
-                        return true;
+                    if buffer.samples().is_empty() {
+                        continue;
                     }
+                    samples.clear();
+                    samples.extend_from_slice(buffer.samples());
+                    return Some((spec.channels.count(), spec.rate));
                 }
                 Err(SymphoniaError::DecodeError(_)) => continue,
-                Err(_) => return false,
+                Err(_) => return None,
+            }
+        }
+    }
+}
+
+/// Converts one decoder's channels and sample rate to the single stream
+/// format, so consecutive tracks in different formats still meet
+/// sample-exactly at the boundary. Rate conversion is linear interpolation
+/// between source frames; equal rates and channels are a plain copy.
+struct Mixer {
+    source_channels: usize,
+    output_channels: usize,
+    /// Source frames consumed per output frame.
+    ratio: f64,
+    /// Fractional position of the next output frame, relative to the front of
+    /// `input`, always below one frame after normalization.
+    position: f64,
+    input: VecDeque<f32>,
+}
+
+impl Mixer {
+    fn new(
+        source_channels: usize,
+        source_rate: u32,
+        output_channels: usize,
+        output_rate: u32,
+    ) -> Self {
+        Self {
+            source_channels: source_channels.max(1),
+            output_channels: output_channels.max(1),
+            ratio: f64::from(source_rate) / f64::from(output_rate),
+            position: 0.0,
+            input: VecDeque::new(),
+        }
+    }
+
+    fn push(&mut self, samples: &[f32]) {
+        self.input.extend(samples.iter().copied());
+    }
+
+    /// Converts buffered input into interleaved output frames. Mid-stream a
+    /// frame waits for its second interpolation tap instead of inventing a
+    /// clamped value early; at end of stream the tail is flushed by clamping
+    /// to the last sample, so a track yields exactly ceil(frames / ratio)
+    /// output frames.
+    fn produce(&mut self, output: &mut VecDeque<f32>, end_of_stream: bool) {
+        if self.ratio == 1.0 && self.source_channels == self.output_channels {
+            output.extend(self.input.drain(..));
+            return;
+        }
+        loop {
+            let available = self.input.len() / self.source_channels;
+            let base = self.position.floor() as usize;
+            if base >= available {
+                return;
+            }
+            if base + 1 >= available && !end_of_stream {
+                return;
+            }
+            let fraction = self.position - base as f64;
+            let first = base * self.source_channels;
+            let second = if base + 1 < available {
+                first + self.source_channels
+            } else {
+                first
+            };
+            for channel in 0..self.output_channels {
+                let a = self.channel_value(first, channel);
+                let b = self.channel_value(second, channel);
+                output.push_back((a + (b - a) * fraction) as f32);
+            }
+            self.position += self.ratio;
+            let consumed = self.position.floor() as usize;
+            if consumed > 0 {
+                self.input
+                    .drain(..(consumed * self.source_channels).min(self.input.len()));
+                self.position -= consumed as f64;
             }
         }
     }
 
-    fn write_frame(&mut self, output: &mut [f32]) -> bool {
-        if self.cursor + self.source_channels.max(1) > self.decoded.len() && !self.decode_packet() {
-            return false;
+    /// Maps one source frame to an output channel: mono is duplicated, a
+    /// multi-channel source is averaged into a mono output, and otherwise the
+    /// shared channels are copied and extra output channels repeat the last
+    /// source channel.
+    fn channel_value(&self, frame_start: usize, channel: usize) -> f64 {
+        if self.output_channels == 1 && self.source_channels > 1 {
+            let sum: f64 = (0..self.source_channels)
+                .map(|index| f64::from(self.input[frame_start + index]))
+                .sum();
+            sum / self.source_channels as f64
+        } else {
+            f64::from(self.input[frame_start + channel.min(self.source_channels - 1)])
         }
-        if self.source_channels == 0 {
-            return false;
-        }
+    }
+}
 
-        let source_frame = self.cursor / self.source_channels;
-        let base = source_frame * self.source_channels;
-        for (channel, sample) in output.iter_mut().enumerate() {
-            *sample = if self.source_channels == 1 {
-                self.decoded[base]
-            } else {
-                self.decoded[base + channel.min(self.source_channels - 1)]
-            };
-        }
+/// One queue entry being decoded and converted to the stream format. Holds a
+/// bounded span of converted audio, never the whole file. Used for the playing
+/// track and for decode-ahead of the next queue entry.
+struct PreparedTrack {
+    queue_index: usize,
+    source: TrackSource,
+    mixer: Option<Mixer>,
+    converted: VecDeque<f32>,
+    scratch: Vec<f32>,
+    finished: bool,
+    output_rate: u32,
+    output_channels: usize,
+}
 
-        self.rate_position += self.source_rate as f64 / self.output_rate as f64;
-        let advance = self.rate_position.floor() as usize;
-        self.rate_position -= advance as f64;
-        self.cursor = self.cursor.saturating_add(advance * self.source_channels);
-        true
+impl PreparedTrack {
+    fn open(
+        path: &Path,
+        queue_index: usize,
+        output_rate: u32,
+        output_channels: usize,
+    ) -> std::result::Result<Self, SymphoniaError> {
+        Ok(Self {
+            queue_index,
+            source: TrackSource::open(path)?,
+            mixer: None,
+            converted: VecDeque::new(),
+            scratch: Vec::new(),
+            finished: false,
+            output_rate,
+            output_channels,
+        })
+    }
+
+    /// True once the source is exhausted and every converted frame was drained.
+    fn drained(&self) -> bool {
+        self.finished && self.converted.is_empty()
+    }
+
+    /// Decodes until at least `frames` converted frames are buffered or the
+    /// track ends, converting channels and rate as packets arrive.
+    fn fill(&mut self, frames: usize) {
+        let target = frames.saturating_mul(self.output_channels);
+        while self.converted.len() < target && !self.finished {
+            match self.source.decode_packet_into(&mut self.scratch) {
+                Some((channels, rate)) => {
+                    let mixer = self.mixer.get_or_insert_with(|| {
+                        Mixer::new(channels, rate, self.output_channels, self.output_rate)
+                    });
+                    mixer.push(&self.scratch);
+                    mixer.produce(&mut self.converted, false);
+                }
+                None => {
+                    if let Some(mixer) = self.mixer.as_mut() {
+                        mixer.produce(&mut self.converted, true);
+                    }
+                    self.finished = true;
+                }
+            }
+        }
+    }
+
+    /// Writes converted interleaved samples into `output`, decoding on demand.
+    /// Returns the number of samples written; zero means the track is drained.
+    fn write_frames(&mut self, output: &mut [f32]) -> usize {
+        if self.converted.is_empty() && !self.finished {
+            self.fill(output.len() / self.output_channels);
+        }
+        let count = output.len().min(self.converted.len());
+        for (target, sample) in output.iter_mut().zip(self.converted.drain(..count)) {
+            *target = sample;
+        }
+        count
     }
 }
 
@@ -657,6 +856,7 @@ pub struct FakeOutputSink {
 struct FakeOutputInner {
     render: Option<RenderCallback>,
     pulls: usize,
+    starts: usize,
 }
 
 impl FakeOutputSink {
@@ -686,6 +886,15 @@ impl FakeOutputSink {
             .unwrap_or_else(|error| error.into_inner())
             .pulls
     }
+
+    /// How often the output stream was opened. Gapless playback opens it once
+    /// for the player's lifetime and never reopens it at a track boundary.
+    pub fn starts(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .starts
+    }
 }
 
 struct FakeRunningOutput;
@@ -699,10 +908,9 @@ impl OutputSink for FakeOutputSink {
         self.channels
     }
     fn start(self: Box<Self>, render: RenderCallback) -> Result<Box<dyn RunningOutput>> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .render = Some(render);
+        let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        inner.starts += 1;
+        inner.render = Some(render);
         Ok(Box::new(FakeRunningOutput))
     }
 }
