@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Linkamp
+Comment=Play your local music library
+Exec=linkamp
+Icon=linkamp
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+StartupWMClass=linkamp
