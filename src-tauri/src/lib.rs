@@ -1,4 +1,5 @@
 pub mod library;
+pub mod mpris;
 pub mod player;
 
 use std::fs;
@@ -53,7 +54,7 @@ fn write_state(app: &tauri::AppHandle, state: &ShellState) -> Result<(), String>
     fs::write(path, text).map_err(|err| err.to_string())
 }
 
-fn show_main(app: &tauri::AppHandle) {
+pub(crate) fn show_main(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.unminimize();
         let _ = window.show();
@@ -414,6 +415,11 @@ pub fn run() {
                 let _ = player_events.emit("player-changed", snapshot);
             });
             app.manage(Arc::clone(&player));
+
+            // Media keys and the XFCE volume plugin arrive through MPRIS.
+            // The thread outlives the window, so hiding to the tray keeps
+            // the bus served.
+            mpris::serve(app.handle().clone(), Arc::clone(&player));
 
             let watch = start_library_watcher(Arc::clone(&library), app.handle().clone());
             app.manage(watch);

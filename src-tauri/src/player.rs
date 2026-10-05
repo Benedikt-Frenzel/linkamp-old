@@ -10,10 +10,11 @@ use serde::{Deserialize, Serialize};
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{Decoder, DecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::{FormatOptions, FormatReader};
+use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
+use symphonia::core::units::TimeBase;
 
 use crate::library::Track;
 
@@ -97,6 +98,9 @@ pub struct PlayerSnapshot {
     pub playing: bool,
     pub shuffle: bool,
     pub repeat: RepeatMode,
+    /// Elapsed time inside the current entry. It advances only while samples
+    /// reach the sink, so a pause freezes it, and it restarts with each track.
+    pub position_ms: u64,
 }
 
 impl Default for PlayerSnapshot {
@@ -107,6 +111,7 @@ impl Default for PlayerSnapshot {
             playing: false,
             shuffle: false,
             repeat: RepeatMode::Off,
+            position_ms: 0,
         }
     }
 }
@@ -142,7 +147,22 @@ impl Core {
         for entry in &mut snapshot.queue {
             entry.missing = !entry.path.is_file();
         }
+        snapshot.position_ms = self.frames_to_ms(self.frames_in_current);
         snapshot
+    }
+
+    fn frames_to_ms(&self, frames: u64) -> u64 {
+        if self.sample_rate == 0 {
+            return 0;
+        }
+        frames * 1000 / u64::from(self.sample_rate)
+    }
+
+    fn ms_to_frames(&self, ms: u64) -> u64 {
+        if self.sample_rate == 0 {
+            return 0;
+        }
+        ms.saturating_mul(u64::from(self.sample_rate)) / 1000
     }
 
     fn open_current(&mut self) -> bool {
@@ -277,6 +297,42 @@ impl Core {
         self.frames_in_current = 0;
         if self.state.playing {
             self.open_current();
+        }
+    }
+
+    /// Positions playback inside the current entry. A position at or past the
+    /// entry's tagged duration, or one the file cannot supply, behaves like
+    /// reaching the end of the track: playback continues with the next entry.
+    fn seek(&mut self, position_ms: u64) {
+        let Some(index) = self.state.current_index else {
+            return;
+        };
+        let Some(entry) = self.state.queue.get(index) else {
+            return;
+        };
+        if position_ms >= entry.duration_ms {
+            let was_playing = self.state.playing;
+            self.advance();
+            self.state.playing = was_playing && self.state.current_index.is_some();
+            return;
+        }
+        if self.current.is_none() && !self.open_current() {
+            let was_playing = self.state.playing;
+            self.advance();
+            self.state.playing = was_playing && self.state.current_index.is_some();
+            return;
+        }
+        let target = self.ms_to_frames(position_ms);
+        let reached = self
+            .current
+            .as_mut()
+            .is_some_and(|track| track.seek_to(target));
+        if reached {
+            self.frames_in_current = target;
+        } else {
+            let was_playing = self.state.playing;
+            self.advance();
+            self.state.playing = was_playing && self.state.current_index.is_some();
         }
     }
 
@@ -479,6 +535,10 @@ impl Player {
                     core.upcoming = None;
                     core.frames_in_current = 0;
                 }
+                if core.current.is_none() {
+                    // Nothing is decoded: the current entry starts from the top.
+                    core.frames_in_current = 0;
+                }
                 core.state.playing = true;
             }
             core.snapshot()
@@ -521,6 +581,47 @@ impl Player {
         let snapshot = {
             let mut core = self.core.lock().unwrap_or_else(|error| error.into_inner());
             core.previous();
+            core.snapshot()
+        };
+        self.emit(snapshot.clone());
+        snapshot
+    }
+
+    /// Stops playback and rewinds to the start of the current entry. The queue
+    /// and the current entry stay, so Play starts the same entry again.
+    pub fn stop(&self) -> PlayerSnapshot {
+        let snapshot = {
+            let mut core = self.core.lock().unwrap_or_else(|error| error.into_inner());
+            core.state.playing = false;
+            core.current = None;
+            core.upcoming = None;
+            core.frames_in_current = 0;
+            core.snapshot()
+        };
+        self.emit(snapshot.clone());
+        snapshot
+    }
+
+    /// Seeks relative to the current position. A negative offset rewinds; the
+    /// result is clamped to the current entry.
+    pub fn seek(&self, offset_ms: i64) -> PlayerSnapshot {
+        let snapshot = {
+            let mut core = self.core.lock().unwrap_or_else(|error| error.into_inner());
+            let current = core.frames_to_ms(core.frames_in_current) as i64;
+            let target = current.saturating_add(offset_ms).max(0) as u64;
+            core.seek(target);
+            core.snapshot()
+        };
+        self.emit(snapshot.clone());
+        snapshot
+    }
+
+    /// Positions playback at `position_ms` inside the current entry. Positions
+    /// past the entry's end move to the next entry, like a seek past the end.
+    pub fn seek_to_ms(&self, position_ms: u64) -> PlayerSnapshot {
+        let snapshot = {
+            let mut core = self.core.lock().unwrap_or_else(|error| error.into_inner());
+            core.seek(position_ms);
             core.snapshot()
         };
         self.emit(snapshot.clone());
@@ -615,9 +716,11 @@ fn emit_to(handler: &Mutex<Option<EventHandler>>, snapshot: PlayerSnapshot) {
 /// Symphonia decoding of one file into interleaved f32 samples in the file's
 /// own channel layout and sample rate. The mixer converts from there.
 struct TrackSource {
+    path: PathBuf,
     format: Box<dyn FormatReader>,
     decoder: Box<dyn Decoder>,
     track_id: u32,
+    time_base: Option<TimeBase>,
 }
 
 impl TrackSource {
@@ -639,12 +742,15 @@ impl TrackSource {
             "file has no default audio track",
         ))?;
         let track_id = track.id;
+        let time_base = track.codec_params.time_base;
         let decoder = symphonia::default::get_codecs()
             .make(&track.codec_params, &DecoderOptions::default())?;
         Ok(Self {
+            path: path.to_owned(),
             format,
             decoder,
             track_id,
+            time_base,
         })
     }
 
@@ -777,6 +883,9 @@ struct PreparedTrack {
     converted: VecDeque<f32>,
     scratch: Vec<f32>,
     finished: bool,
+    /// Output frames handed out or discarded since the file was opened or
+    /// last seeked. Anchors a seek target to the absolute stream position.
+    frames_rendered: u64,
     output_rate: u32,
     output_channels: usize,
 }
@@ -795,6 +904,7 @@ impl PreparedTrack {
             converted: VecDeque::new(),
             scratch: Vec::new(),
             finished: false,
+            frames_rendered: 0,
             output_rate,
             output_channels,
         })
@@ -838,7 +948,70 @@ impl PreparedTrack {
         for (target, sample) in output.iter_mut().zip(self.converted.drain(..count)) {
             *target = sample;
         }
+        self.frames_rendered += (count / self.output_channels.max(1)) as u64;
         count
+    }
+
+    /// Positions the stream so that the next frame handed out is `target`,
+    /// counted in output frames since the start of the file. The demuxer seeks
+    /// first; only the remaining gap is decoded and discarded. Returns false
+    /// when the file ends before the target.
+    fn seek_to(&mut self, target: u64) -> bool {
+        let Some(landed) = self.demuxer_seek(target) else {
+            return false;
+        };
+        self.mixer = None;
+        self.converted.clear();
+        self.finished = false;
+        self.frames_rendered = landed;
+        let channels = self.output_channels.max(1);
+        while self.frames_rendered < target {
+            self.fill(64);
+            if self.converted.is_empty() {
+                return false;
+            }
+            let drop = ((target - self.frames_rendered) as usize)
+                .min(self.converted.len() / channels);
+            self.converted.drain(..drop * channels);
+            self.frames_rendered += drop as u64;
+        }
+        true
+    }
+
+    /// Moves the demuxer near `target` and returns the absolute output-frame
+    /// position it landed on, discarding buffered samples. When the container
+    /// cannot seek, the file is reopened from the top instead. Returns None
+    /// when even a reopen fails.
+    fn demuxer_seek(&mut self, target: u64) -> Option<u64> {
+        if let Some(time_base) = self.source.time_base {
+            let seconds = target as f64 / f64::from(self.output_rate);
+            let timestamp =
+                (seconds * f64::from(time_base.denom) / f64::from(time_base.numer)).floor()
+                    as u64;
+            let sought = self.source.format.seek(
+                SeekMode::Accurate,
+                SeekTo::TimeStamp {
+                    track_id: self.source.track_id,
+                    ts: timestamp,
+                },
+            );
+            if let Ok(seeked) = sought {
+                self.source.decoder.reset();
+                let landed = seeked.actual_ts as f64 * f64::from(time_base.numer)
+                    / f64::from(time_base.denom);
+                return Some((landed * f64::from(self.output_rate)).round() as u64);
+            }
+        }
+        // Reopen from the top when the container cannot seek or reports no
+        // time base; the caller closes the remaining gap by discarding.
+        let path = self.source.path.clone();
+        match TrackSource::open(&path) {
+            Ok(fresh) => {
+                self.source = fresh;
+                Some(0)
+            }
+            Err(_) => None,
+        }
     }
 }
 

@@ -92,6 +92,7 @@ type PlayerSnapshot = {
   playing: boolean;
   shuffle: boolean;
   repeat: RepeatMode;
+  positionMs: number;
 };
 
 const INITIAL_PLAYER: PlayerSnapshot = {
@@ -100,6 +101,7 @@ const INITIAL_PLAYER: PlayerSnapshot = {
   playing: false,
   shuffle: false,
   repeat: "off",
+  positionMs: 0,
 };
 
 const NEXT_REPEAT: Record<RepeatMode, RepeatMode> = {
