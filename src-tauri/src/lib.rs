@@ -336,6 +336,21 @@ fn player_previous(player: State<'_, Arc<Player>>) -> PlayerSnapshot {
 }
 
 #[tauri::command]
+fn player_seek(player: State<'_, Arc<Player>>, offset_ms: i64) -> PlayerSnapshot {
+    player.seek(offset_ms)
+}
+
+#[tauri::command]
+fn player_seek_to(player: State<'_, Arc<Player>>, position_ms: u64) -> PlayerSnapshot {
+    player.seek_to_ms(position_ms)
+}
+
+#[tauri::command]
+fn player_set_volume(player: State<'_, Arc<Player>>, volume: f64) -> PlayerSnapshot {
+    player.set_volume(volume as f32)
+}
+
+#[tauri::command]
 fn player_set_shuffle(
     player: State<'_, Arc<Player>>,
     on: bool,
@@ -380,6 +395,9 @@ pub fn run() {
             player_toggle,
             player_next,
             player_previous,
+            player_seek,
+            player_seek_to,
+            player_set_volume,
             player_set_shuffle,
             player_set_repeat
         ])
