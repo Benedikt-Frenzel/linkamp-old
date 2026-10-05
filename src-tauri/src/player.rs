@@ -71,12 +71,28 @@ impl From<Track> for QueueEntry {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RepeatMode {
+    Off,
+    All,
+    One,
+}
+
+impl Default for RepeatMode {
+    fn default() -> Self {
+        Self::Off
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlayerSnapshot {
     pub queue: Vec<QueueEntry>,
     pub current_index: Option<usize>,
     pub playing: bool,
+    pub shuffle: bool,
+    pub repeat: RepeatMode,
 }
 
 impl Default for PlayerSnapshot {
@@ -85,12 +101,24 @@ impl Default for PlayerSnapshot {
             queue: Vec::new(),
             current_index: None,
             playing: false,
+            shuffle: false,
+            repeat: RepeatMode::Off,
         }
     }
 }
 
 struct Core {
     state: PlayerSnapshot,
+    /// The queue in its original, unshuffled order. Turning shuffle off
+    /// restores the playback queue from this snapshot.
+    original_queue: Vec<QueueEntry>,
+    /// Number of output frames rendered for the current entry since it was
+    /// opened. Used by the Previous restart rule.
+    frames_in_current: u64,
+    /// Above this many frames, Previous restarts the current entry instead of
+    /// jumping back. Defaults to a few seconds at the output rate.
+    previous_restart_threshold_frames: u64,
+    shuffle_rng: ShuffleRng,
     decoder: Option<AudioDecoder>,
     sample_rate: u32,
     channels: usize,
@@ -112,6 +140,7 @@ impl Core {
         match AudioDecoder::open(&entry.path, self.sample_rate) {
             Ok(decoder) => {
                 self.decoder = Some(decoder);
+                self.frames_in_current = 0;
                 true
             }
             Err(error) => {
@@ -123,31 +152,58 @@ impl Core {
     }
 
     fn next(&mut self) -> bool {
-        let next = self.state.current_index.map_or(0, |index| index + 1);
-        if next >= self.state.queue.len() {
+        if self.state.repeat == RepeatMode::One && self.state.current_index.is_some() {
+            // Replay the current entry from the top.
+            self.decoder = None;
+            return self.open_current();
+        }
+        let next_index = self.state.current_index.map_or(0, |index| index + 1);
+        if next_index >= self.state.queue.len() {
+            if self.state.repeat == RepeatMode::All && !self.state.queue.is_empty() {
+                self.state.current_index = Some(0);
+                self.decoder = None;
+                return self.open_current();
+            }
+            // Repeat Off and at the end: stop with the queue in place.
             self.state.playing = false;
+            self.state.current_index = None;
             self.decoder = None;
             return false;
         }
-        self.state.current_index = Some(next);
+        self.state.current_index = Some(next_index);
         self.decoder = None;
         self.open_current()
     }
 
     fn previous(&mut self) {
-        let previous = self
-            .state
-            .current_index
-            .map_or(0, |index| index.saturating_sub(1));
         if self.state.queue.is_empty() {
             self.state.current_index = None;
             self.state.playing = false;
-        } else {
-            self.state.current_index = Some(previous);
+            self.frames_in_current = 0;
+            return;
+        }
+        // A stopped queue (current_index is None) jumps back to the last entry
+        // so the listener lands on what just played.
+        let current = self
+            .state
+            .current_index
+            .unwrap_or(self.state.queue.len() - 1);
+        if current == 0 || self.frames_in_current > self.previous_restart_threshold_frames {
+            // At the head, or further than a few seconds in: restart the
+            // current entry.
+            self.state.current_index = Some(current);
             self.decoder = None;
+            self.frames_in_current = 0;
             if self.state.playing {
                 self.open_current();
             }
+            return;
+        }
+        self.state.current_index = Some(current - 1);
+        self.decoder = None;
+        self.frames_in_current = 0;
+        if self.state.playing {
+            self.open_current();
         }
     }
 
@@ -173,6 +229,7 @@ impl Core {
                 decoder.write_frame(&mut output[cursor..cursor + self.channels])
             });
             if wrote_frame {
+                self.frames_in_current = self.frames_in_current.saturating_add(1);
                 cursor += self.channels;
             } else {
                 self.decoder = None;
@@ -235,6 +292,10 @@ impl Player {
         let channels = sink.channels().max(1);
         let core = Arc::new(Mutex::new(Core {
             state: PlayerSnapshot::default(),
+            original_queue: Vec::new(),
+            frames_in_current: 0,
+            previous_restart_threshold_frames: u64::from(sample_rate) * 3,
+            shuffle_rng: ShuffleRng::new(),
             decoder: None,
             sample_rate,
             channels,
@@ -289,10 +350,18 @@ impl Player {
             })?;
         let snapshot = {
             let mut core = self.core.lock().unwrap_or_else(|error| error.into_inner());
-            core.state.queue = entries.into_iter().skip(start).collect();
+            let mut queue = entries.into_iter().skip(start).collect::<Vec<_>>();
+            core.original_queue = queue.clone();
+            if core.state.shuffle && queue.len() > 1 {
+                let mut tail = queue.split_off(1);
+                shuffle_slice(&mut tail, &mut core.shuffle_rng);
+                queue.extend(tail);
+            }
+            core.state.queue = queue;
             core.state.current_index = (!core.state.queue.is_empty()).then_some(0);
             core.state.playing = !core.state.queue.is_empty();
             core.decoder = None;
+            core.frames_in_current = 0;
             core.save_queue()?;
             core.snapshot()
         };
@@ -304,9 +373,12 @@ impl Player {
         let snapshot = {
             let mut core = self.core.lock().unwrap_or_else(|error| error.into_inner());
             if !core.state.queue.is_empty() {
+                // A None current index means the queue has either never played
+                // or has just ended. Both cases start the queue from the top.
                 if core.state.current_index.is_none() {
                     core.state.current_index = Some(0);
                     core.decoder = None;
+                    core.frames_in_current = 0;
                 }
                 core.state.playing = true;
             }
@@ -361,6 +433,64 @@ impl Player {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .snapshot()
+    }
+
+    /// Toggles shuffle over the live queue. Turning shuffle on keeps the
+    /// current entry in place and rearranges the entries after it. Turning it
+    /// off restores the queue to its original order and keeps the same entry
+    /// current.
+    pub fn set_shuffle(&self, on: bool) -> PlayerSnapshot {
+        let snapshot = {
+            let mut core = self.core.lock().unwrap_or_else(|error| error.into_inner());
+            if on != core.state.shuffle {
+                if on {
+                    let split_at = core
+                        .state
+                        .current_index
+                        .map(|index| index + 1)
+                        .unwrap_or(0);
+                    if split_at < core.state.queue.len() {
+                        let mut tail = core.state.queue.split_off(split_at);
+                        shuffle_slice(&mut tail, &mut core.shuffle_rng);
+                        core.state.queue.extend(tail);
+                    }
+                } else {
+                    let current_path = core
+                        .state
+                        .current_index
+                        .and_then(|index| core.state.queue.get(index))
+                        .map(|entry| entry.path.clone());
+                    core.state.queue = core.original_queue.clone();
+                    core.state.current_index = current_path.and_then(|path| {
+                        core.state.queue
+                            .iter()
+                            .position(|entry| entry.path == path)
+                    });
+                    core.decoder = None;
+                    core.frames_in_current = 0;
+                }
+                core.state.shuffle = on;
+            }
+            core.snapshot()
+        };
+        self.emit(snapshot.clone());
+        snapshot
+    }
+
+    pub fn set_repeat(&self, mode: RepeatMode) -> PlayerSnapshot {
+        let snapshot = {
+            let mut core = self.core.lock().unwrap_or_else(|error| error.into_inner());
+            core.state.repeat = mode;
+            core.snapshot()
+        };
+        self.emit(snapshot.clone());
+        snapshot
+    }
+
+    #[doc(hidden)]
+    pub fn set_previous_restart_threshold_for_testing(&self, frames: u64) {
+        let mut core = self.core.lock().unwrap_or_else(|error| error.into_inner());
+        core.previous_restart_threshold_frames = frames;
     }
 
     fn emit(&self, snapshot: PlayerSnapshot) {
@@ -704,5 +834,39 @@ impl OutputSink for FakeOutputSink {
             .unwrap_or_else(|error| error.into_inner())
             .render = Some(render);
         Ok(Box::new(FakeRunningOutput))
+    }
+}
+
+/// Fisher-Yates shuffle driven by a small deterministic RNG. The state is
+/// reseeded on each Player open, so a given player produces a different order
+/// each time shuffle is turned on, which is what the spec asks for.
+struct ShuffleRng(u64);
+
+impl ShuffleRng {
+    fn new() -> Self {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos() as u64)
+            .unwrap_or(0x9E3779B97F4A7C15);
+        Self(splitmix64(nanos ^ 0x9E3779B97F4A7C15))
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.0 = splitmix64(self.0);
+        self.0
+    }
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D049BB133111EB);
+    value ^ (value >> 31)
+}
+
+fn shuffle_slice<T>(slice: &mut [T], rng: &mut ShuffleRng) {
+    for index in (1..slice.len()).rev() {
+        let chosen = (rng.next_u64() as usize) % (index + 1);
+        slice.swap(index, chosen);
     }
 }
