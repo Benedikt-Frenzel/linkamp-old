@@ -25,6 +25,7 @@ fn entry(path: PathBuf, title: &str) -> QueueEntry {
         artist: Some("Test Artist".to_owned()),
         album: "Test Album".to_owned(),
         duration_ms: 150,
+        missing: false,
     }
 }
 
@@ -189,6 +190,101 @@ fn player_commands_remain_usable_without_an_audio_device() {
     assert!(!player.pause().playing);
     assert!(player.play().playing);
     assert_eq!(player.previous().current_index, Some(0));
+}
+
+#[test]
+fn a_missing_middle_entry_keeps_its_snapshot_and_is_skipped() {
+    let temp = TempDir::new().unwrap();
+    let album = temp.path().join("Album");
+    let first = audio_file(&album, "first", "mp3");
+    let missing = audio_file(&album, "missing", "flac");
+    let last = audio_file(&album, "last", "mp3");
+    let last_contents = fs::read(&last).unwrap();
+    let sink = FakeOutputSink::new(44_100, 2);
+    let player = Player::open(temp.path().join("library.db"), sink.clone()).unwrap();
+    let mut missing_entry = entry(missing.clone(), "Remembered title");
+    missing_entry.artist = Some("Remembered artist".to_owned());
+    missing_entry.album = "Remembered album".to_owned();
+    missing_entry.duration_ms = 123_456;
+    player
+        .play_entries(
+            vec![
+                entry(first.clone(), "First"),
+                missing_entry,
+                entry(last.clone(), "Last"),
+            ],
+            &first,
+        )
+        .unwrap();
+
+    fs::remove_file(&missing).unwrap();
+    let queued = player.snapshot();
+    assert!(queued.queue[1].missing);
+    assert_eq!(queued.queue[1].title, "Remembered title");
+    assert_eq!(queued.queue[1].artist.as_deref(), Some("Remembered artist"));
+    assert_eq!(queued.queue[1].album, "Remembered album");
+    assert_eq!(queued.queue[1].duration_ms, 123_456);
+
+    for _ in 0..30 {
+        sink.pull(500);
+        if player.snapshot().current_index == Some(2) {
+            break;
+        }
+    }
+    let after_skip = player.snapshot();
+    assert_eq!(after_skip.current_index, Some(2));
+    assert!(
+        after_skip.playing,
+        "playback continues after the missing row"
+    );
+    assert_eq!(fs::read(&last).unwrap(), last_contents);
+    assert!(first.is_file());
+    assert!(!missing.exists());
+}
+
+#[test]
+fn missing_entries_at_the_queue_edges_are_skipped() {
+    let temp = TempDir::new().unwrap();
+    let album = temp.path().join("Album");
+    let missing_first = audio_file(&album, "missing-first", "mp3");
+    let playable = audio_file(&album, "playable", "flac");
+    let missing_last = audio_file(&album, "missing-last", "mp3");
+    let sink = FakeOutputSink::new(44_100, 2);
+    let player = Player::open(temp.path().join("library.db"), sink.clone()).unwrap();
+    player
+        .play_entries(
+            vec![
+                entry(missing_first.clone(), "Missing first"),
+                entry(playable.clone(), "Playable"),
+                entry(missing_last.clone(), "Missing last"),
+            ],
+            &missing_first,
+        )
+        .unwrap();
+    fs::remove_file(&missing_first).unwrap();
+    fs::remove_file(&missing_last).unwrap();
+
+    sink.pull(1);
+    let after_first = player.snapshot();
+    assert_eq!(after_first.current_index, Some(1));
+    assert!(after_first.playing);
+    assert!(after_first.queue[0].missing);
+    assert!(after_first.queue[2].missing);
+
+    for _ in 0..30 {
+        sink.pull(500);
+        if !player.snapshot().playing {
+            break;
+        }
+    }
+    let after_last = player.snapshot();
+    assert!(!after_last.playing, "a missing final row ends the queue");
+    assert_eq!(
+        after_last.current_index,
+        Some(1),
+        "the missing row never becomes the played track"
+    );
+    assert!(playable.is_file());
 }
 
 #[test]

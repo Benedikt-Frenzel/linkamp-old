@@ -57,6 +57,8 @@ pub struct QueueEntry {
     pub artist: Option<String>,
     pub album: String,
     pub duration_ms: u64,
+    #[serde(default)]
+    pub missing: bool,
 }
 
 impl From<Track> for QueueEntry {
@@ -67,6 +69,7 @@ impl From<Track> for QueueEntry {
             artist: track.artist,
             album: track.album,
             duration_ms: track.duration_ms,
+            missing: false,
         }
     }
 }
@@ -99,7 +102,11 @@ struct Core {
 
 impl Core {
     fn snapshot(&self) -> PlayerSnapshot {
-        self.state.clone()
+        let mut snapshot = self.state.clone();
+        for entry in &mut snapshot.queue {
+            entry.missing = !entry.path.is_file();
+        }
+        snapshot
     }
 
     fn open_current(&mut self) -> bool {
@@ -123,15 +130,20 @@ impl Core {
     }
 
     fn next(&mut self) -> bool {
-        let next = self.state.current_index.map_or(0, |index| index + 1);
-        if next >= self.state.queue.len() {
-            self.state.playing = false;
+        let previous = self.state.current_index;
+        let mut next = previous.map_or(0, |index| index + 1);
+        while next < self.state.queue.len() {
+            self.state.current_index = Some(next);
             self.decoder = None;
-            return false;
+            if self.open_current() {
+                return true;
+            }
+            next += 1;
         }
-        self.state.current_index = Some(next);
+        self.state.current_index = previous;
+        self.state.playing = false;
         self.decoder = None;
-        self.open_current()
+        false
     }
 
     fn previous(&mut self) {
