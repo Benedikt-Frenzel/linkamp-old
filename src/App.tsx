@@ -80,7 +80,15 @@ const INITIAL_LIBRARY: LibrarySnapshot = {
 
 const UNKNOWN_KEY = "\0unknown";
 
-type TransportCommand = "play" | "pause" | "next" | "previous";
+type QueueTrack = Pick<Track, "path" | "title" | "artist" | "album" | "durationMs">;
+
+type PlayerSnapshot = {
+  queue: QueueTrack[];
+  currentIndex: number | null;
+  playing: boolean;
+};
+
+const INITIAL_PLAYER: PlayerSnapshot = { queue: [], currentIndex: null, playing: false };
 
 function emptyMessage(
   section: SectionId,
@@ -107,12 +115,16 @@ function VirtualTrackList({
   tracks,
   resetKey,
   selectedPath,
+  currentPath,
   onSelect,
+  onActivate,
 }: {
-  tracks: Track[];
+  tracks: QueueTrack[];
   resetKey: string;
   selectedPath: string | null;
+  currentPath?: string | null;
   onSelect: (path: string) => void;
+  onActivate: (path: string) => void;
 }) {
   const viewportRef = useRef<HTMLDivElement>(null);
   const [scrollTop, setScrollTop] = useState(0);
@@ -159,16 +171,19 @@ function VirtualTrackList({
           {tracks.slice(start, end).map((track, offset) => {
             const index = start + offset;
             const selected = track.path === selectedPath;
+            const current = track.path === currentPath;
             return (
               <button
                 type="button"
-                className={selected ? "track-row selected" : "track-row"}
+                className={`track-row${selected ? " selected" : ""}${current ? " current" : ""}`}
                 key={track.path}
                 role="row"
                 aria-rowindex={index + 1}
                 aria-selected={selected}
+                aria-current={current ? "true" : undefined}
                 style={{ transform: `translateY(${index * rowHeight}px)` }}
                 onClick={() => onSelect(track.path)}
+                onDoubleClick={() => onActivate(track.path)}
               >
                 <span role="cell" title={track.title}>{track.title}</span>
                 <span role="cell" title={track.artist ?? "Unknown"}>{track.artist ?? "Unknown"}</span>
@@ -185,7 +200,7 @@ function VirtualTrackList({
 
 export function App() {
   const [section, setSection] = useState<SectionId>("now-playing");
-  const [playing, setPlaying] = useState(false);
+  const [player, setPlayer] = useState<PlayerSnapshot>(INITIAL_PLAYER);
   const [menuOpen, setMenuOpen] = useState(false);
   const [alwaysOnTop, setAlwaysOnTop] = useState(false);
   const [presetView, setPresetView] = useState(false);
@@ -316,15 +331,11 @@ export function App() {
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
-    void listen<TransportCommand>("transport", (event) => {
-      if (event.payload === "play") setPlaying(true);
-      if (event.payload === "pause") setPlaying(false);
-    }).then((stop) => {
+    void invoke<PlayerSnapshot>("player_snapshot").then(setPlayer).catch(() => {});
+    void listen<PlayerSnapshot>("player-changed", (event) => setPlayer(event.payload)).then((stop) => {
       unlisten = stop;
     });
-    return () => {
-      unlisten?.();
-    };
+    return () => unlisten?.();
   }, []);
 
   useEffect(() => {
@@ -341,7 +352,16 @@ export function App() {
       if (typing) return;
       if (event.key === " ") {
         event.preventDefault();
-        setPlaying((value) => !value);
+        void runPlayerCommand("player_toggle");
+      } else if (event.key === "Enter" && selectedTrackPath) {
+        event.preventDefault();
+        void activateTrack(selectedTrackPath);
+      } else if (event.ctrlKey && event.key === "ArrowRight") {
+        event.preventDefault();
+        void runPlayerCommand("player_next");
+      } else if (event.ctrlKey && event.key === "ArrowLeft") {
+        event.preventDefault();
+        void runPlayerCommand("player_previous");
       } else if (event.key.toLowerCase() === "v") {
         setPresetView((value) => !value);
       } else if (event.key.toLowerCase() === "f") {
@@ -353,7 +373,7 @@ export function App() {
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, []);
+  }, [selectedTrackPath, section, query, player.queue, tracks]);
 
   useEffect(() => {
     function onPointerDown(event: MouseEvent) {
@@ -416,6 +436,27 @@ export function App() {
     }
   }
 
+  async function runPlayerCommand(command: string) {
+    try {
+      setPlayer(await invoke<PlayerSnapshot>(command));
+    } catch {
+      // A missing device or unreadable file must not make the window unusable.
+    }
+  }
+
+  async function activateTrack(path: string) {
+    const visible = section === "now-playing" && !isSearching ? player.queue : tracks;
+    try {
+      const snapshot = await invoke<PlayerSnapshot>("play_tracks", {
+        tracks: visible,
+        startPath: path,
+      });
+      setPlayer(snapshot);
+    } catch {
+      // Keep browsing if the selected file can no longer be decoded.
+    }
+  }
+
   function chooseAlbum(albumId: string) {
     setSection("albums");
     setSelection({ kind: "album", id: albumId });
@@ -450,6 +491,11 @@ export function App() {
       (selection.kind === "genre" && section === "genres") ||
       (selection.kind === "year" && section === "years"));
   const showTracks = selectionMatchesSection;
+  const trimmedQuery = query.trim();
+  const isSearching = trimmedQuery.length > 0;
+  const nowPlayingTracks = section === "now-playing" && !isSearching;
+  const visibleTracks: QueueTrack[] = nowPlayingTracks ? player.queue : tracks;
+  const currentPath = player.currentIndex === null ? null : player.queue[player.currentIndex]?.path ?? null;
   const entryCount =
     section === "albums"
       ? library.albums.length
@@ -460,8 +506,6 @@ export function App() {
           : section === "years"
             ? library.years.length
             : 0;
-  const trimmedQuery = query.trim();
-  const isSearching = trimmedQuery.length > 0;
   const trackResetKey = `${
     selection === null
       ? "none"
@@ -510,19 +554,19 @@ export function App() {
         </div>
 
         <div className="buttons" role="group" aria-label="Transport">
-          <button type="button" aria-label="Previous">
+          <button type="button" aria-label="Previous" onClick={() => void runPlayerCommand("player_previous")}>
             Previous
           </button>
           <button
             type="button"
             className="accent"
-            onClick={() => setPlaying((value) => !value)}
-            aria-label={playing ? "Pause" : "Play"}
-            aria-pressed={playing}
+            onClick={() => void runPlayerCommand("player_toggle")}
+            aria-label={player.playing ? "Pause" : "Play"}
+            aria-pressed={player.playing}
           >
-            {playing ? "Pause" : "Play"}
+            {player.playing ? "Pause" : "Play"}
           </button>
-          <button type="button" aria-label="Next">
+          <button type="button" aria-label="Next" onClick={() => void runPlayerCommand("player_next")}>
             Next
           </button>
         </div>
@@ -729,6 +773,19 @@ export function App() {
                 <p>Preset view</p>
                 <p className="muted">Shaders arrive with playback.</p>
               </div>
+            ) : nowPlayingTracks ? (
+              player.queue.length > 0 ? (
+                <VirtualTrackList
+                  tracks={visibleTracks}
+                  resetKey="now-playing"
+                  selectedPath={selectedTrackPath}
+                  currentPath={currentPath}
+                  onSelect={setSelectedTrackPath}
+                  onActivate={(path) => void activateTrack(path)}
+                />
+              ) : (
+                <div className="empty"><p>Nothing is playing.</p></div>
+              )
             ) : isSearching ? (
               tracksLoading ? null : tracks.length > 0 ? (
                 <VirtualTrackList
@@ -736,6 +793,7 @@ export function App() {
                   resetKey={trackResetKey}
                   selectedPath={selectedTrackPath}
                   onSelect={setSelectedTrackPath}
+                  onActivate={(path) => void activateTrack(path)}
                 />
               ) : (
                 <div className="empty"><p>{`No tracks match "${trimmedQuery}"`}</p></div>
@@ -747,6 +805,7 @@ export function App() {
                   resetKey={trackResetKey}
                   selectedPath={selectedTrackPath}
                   onSelect={setSelectedTrackPath}
+                  onActivate={(path) => void activateTrack(path)}
                 />
               ) : library.scanStatus === "complete" && entryCount === 0 ? (
                 <div className="empty"><p>No audio files were found.</p></div>

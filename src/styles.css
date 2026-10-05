@@ -420,7 +420,11 @@ button {
 
 .track-row.selected {
   background: #24382e;
+}
+
+.track-row.current {
   color: var(--accent);
+  box-shadow: inset 3px 0 var(--accent);
 }
 
 .track-row span {
