@@ -82,13 +82,35 @@ const UNKNOWN_KEY = "\0unknown";
 
 type QueueTrack = Pick<Track, "path" | "title" | "artist" | "album" | "durationMs">;
 
+type RepeatMode = "off" | "all" | "one";
+
 type PlayerSnapshot = {
   queue: QueueTrack[];
   currentIndex: number | null;
   playing: boolean;
+  shuffle: boolean;
+  repeat: RepeatMode;
 };
 
-const INITIAL_PLAYER: PlayerSnapshot = { queue: [], currentIndex: null, playing: false };
+const INITIAL_PLAYER: PlayerSnapshot = {
+  queue: [],
+  currentIndex: null,
+  playing: false,
+  shuffle: false,
+  repeat: "off",
+};
+
+const NEXT_REPEAT: Record<RepeatMode, RepeatMode> = {
+  off: "all",
+  all: "one",
+  one: "off",
+};
+
+const REPEAT_LABEL: Record<RepeatMode, string> = {
+  off: "Off",
+  all: "All",
+  one: "One",
+};
 
 function emptyMessage(
   section: SectionId,
@@ -444,6 +466,23 @@ export function App() {
     }
   }
 
+  async function toggleShuffle() {
+    try {
+      setPlayer(await invoke<PlayerSnapshot>("player_set_shuffle", { on: !player.shuffle }));
+    } catch {
+      // Keep the window responsive if the player refuses the change.
+    }
+  }
+
+  async function cycleRepeat() {
+    try {
+      const next = NEXT_REPEAT[player.repeat];
+      setPlayer(await invoke<PlayerSnapshot>("player_set_repeat", { mode: next }));
+    } catch {
+      // Keep the window responsive if the player refuses the change.
+    }
+  }
+
   async function activateTrack(path: string) {
     const visible = section === "now-playing" && !isSearching ? player.queue : tracks;
     try {
@@ -568,6 +607,27 @@ export function App() {
           </button>
           <button type="button" aria-label="Next" onClick={() => void runPlayerCommand("player_next")}>
             Next
+          </button>
+        </div>
+
+        <div className="modes" role="group" aria-label="Playback modes">
+          <button
+            type="button"
+            className={player.shuffle ? "mode active" : "mode"}
+            aria-pressed={player.shuffle}
+            onClick={() => void toggleShuffle()}
+            title="Shuffle"
+          >
+            Shuffle
+          </button>
+          <button
+            type="button"
+            className={player.repeat === "off" ? "mode" : "mode active"}
+            aria-label={`Repeat: ${REPEAT_LABEL[player.repeat]}`}
+            onClick={() => void cycleRepeat()}
+            title={`Repeat: ${REPEAT_LABEL[player.repeat]}`}
+          >
+            {player.repeat === "off" ? "Repeat" : `Repeat ${REPEAT_LABEL[player.repeat]}`}
           </button>
         </div>
 

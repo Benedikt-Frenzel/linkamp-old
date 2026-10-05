@@ -71,6 +71,29 @@ button {
   color: var(--accent);
 }
 
+.modes {
+  display: flex;
+  gap: 6px;
+}
+
+.mode {
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 4px 8px;
+  background: var(--row);
+  color: var(--muted);
+}
+
+.mode:hover {
+  background: #2a2a2a;
+  color: inherit;
+}
+
+.mode.active {
+  color: var(--accent);
+  border-color: #397352;
+}
+
 .menu {
   position: relative;
 }

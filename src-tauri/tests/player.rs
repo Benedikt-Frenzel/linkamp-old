@@ -1,8 +1,9 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use linkamp_lib::library::{LibraryIndex, Track};
-use linkamp_lib::player::{FakeOutputSink, NoDeviceOutputSink, Player, QueueEntry};
+use linkamp_lib::player::{FakeOutputSink, NoDeviceOutputSink, Player, QueueEntry, RepeatMode};
 use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::FormatOptions;
@@ -314,11 +315,16 @@ fn consecutive_tracks_cross_without_a_gap_on_one_open_stream() {
     assert_eq!(player.snapshot().current_index, Some(2));
 
     let _ = sink.pull(frames_three);
-    assert_eq!(player.snapshot().current_index, Some(2));
     let end = sink.pull(1);
+    let stopped = player.snapshot();
     assert!(
-        !player.snapshot().playing,
+        !stopped.playing,
         "playback stops after the queue's last frame"
+    );
+    assert_eq!(
+        stopped.current_index,
+        None,
+        "the stopped queue carries no current entry; Play starts from the top"
     );
     assert!(end.iter().all(|sample| *sample == 0.0));
 
@@ -486,3 +492,275 @@ fn the_next_entry_is_decoded_before_the_current_one_ends() {
     fs::set_permissions(&flac, fs::Permissions::from_mode(0o644)).unwrap();
 }
 
+fn paths(entries: &[QueueEntry]) -> Vec<PathBuf> {
+    entries.iter().map(|entry| entry.path.clone()).collect()
+}
+
+fn paths_set(entries: &[QueueEntry]) -> HashSet<PathBuf> {
+    entries.iter().map(|entry| entry.path.clone()).collect()
+}
+
+fn four_track_queue(temp: &TempDir) -> (Vec<PathBuf>, Player, FakeOutputSink) {
+    let album = temp.path().join("Album");
+    let a = audio_file(&album, "a", "mp3");
+    let b = audio_file(&album, "b", "flac");
+    let c = audio_file(&album, "c", "mp3");
+    let d = audio_file(&album, "d", "flac");
+    let sink = FakeOutputSink::new(44_100, 2);
+    let player = Player::open(temp.path().join("library.db"), sink.clone()).unwrap();
+    player
+        .play_entries(
+            vec![entry(a.clone(), "A"), entry(b.clone(), "B"), entry(c.clone(), "C"), entry(d.clone(), "D")],
+            &a,
+        )
+        .unwrap();
+    (vec![a, b, c, d], player, sink)
+}
+
+#[test]
+fn shuffle_rearranges_only_entries_after_the_current() {
+    let temp = TempDir::new().unwrap();
+    let (paths_in_order, player, _sink) = four_track_queue(&temp);
+    assert_eq!(player.snapshot().queue.iter().map(|e| e.path.clone()).collect::<Vec<_>>(), paths_in_order);
+
+    let shuffled = player.set_shuffle(true).queue;
+    assert_eq!(shuffled[0].path, paths_in_order[0], "the current entry keeps playing");
+    assert_eq!(
+        paths_set(&shuffled[1..]),
+        paths_set(&paths_in_order[1..].iter().map(|p| QueueEntry {
+            path: p.clone(),
+            title: String::new(),
+            artist: None,
+            album: String::new(),
+            duration_ms: 0,
+        }).collect::<Vec<_>>()),
+        "the remaining entries are a permutation of the original tail"
+    );
+}
+
+#[test]
+fn turning_shuffle_off_restores_the_original_order() {
+    let temp = TempDir::new().unwrap();
+    let (paths_in_order, player, _sink) = four_track_queue(&temp);
+    player.set_shuffle(true);
+
+    let restored = player.set_shuffle(false).queue;
+    assert_eq!(
+        paths(&restored),
+        paths_in_order,
+        "turning shuffle off returns the queue to its original order"
+    );
+    assert_eq!(player.snapshot().current_index, Some(0));
+    assert!(!player.snapshot().shuffle);
+}
+
+#[test]
+fn turning_shuffle_on_again_reshuffles_the_remaining_entries() {
+    let temp = TempDir::new().unwrap();
+    let (paths_in_order, player, _sink) = four_track_queue(&temp);
+    let tail: HashSet<PathBuf> = paths_in_order[1..].iter().cloned().collect();
+
+    let first = paths(&player.set_shuffle(true).queue);
+    assert_eq!(first[0], paths_in_order[0]);
+    assert_eq!(first[1..].iter().cloned().collect::<HashSet<_>>(), tail);
+
+    player.set_shuffle(false);
+    let second = paths(&player.set_shuffle(true).queue);
+    assert_eq!(second[0], paths_in_order[0], "the current entry is still anchored");
+    assert_eq!(
+        second[1..].iter().cloned().collect::<HashSet<_>>(),
+        tail,
+        "the remaining entries are again a permutation of the original tail"
+    );
+}
+
+#[test]
+fn repeat_one_replays_the_current_entry_when_it_ends() {
+    let temp = TempDir::new().unwrap();
+    let album = temp.path().join("Album");
+    let first = audio_file(&album, "first", "mp3");
+    let second = audio_file(&album, "second", "flac");
+    let sink = FakeOutputSink::new(44_100, 2);
+    let player = Player::open(temp.path().join("library.db"), sink.clone()).unwrap();
+    player
+        .play_entries(vec![entry(first.clone(), "First"), entry(second.clone(), "Second")], &first)
+        .unwrap();
+    player.set_repeat(RepeatMode::One);
+
+    let mut reached_repeat = false;
+    for _ in 0..40 {
+        sink.pull(1_000);
+        let snapshot = player.snapshot();
+        if snapshot.current_index == Some(1) {
+            // The first track should replay under Repeat One instead of advancing.
+            reached_repeat = true;
+            break;
+        }
+    }
+    assert!(
+        !reached_repeat,
+        "Repeat One must keep the current entry instead of advancing to the next"
+    );
+    let after = player.snapshot();
+    assert_eq!(after.current_index, Some(0));
+    assert!(after.playing);
+}
+
+#[test]
+fn repeat_all_wraps_from_the_last_entry_to_the_first() {
+    let temp = TempDir::new().unwrap();
+    let album = temp.path().join("Album");
+    let first = audio_file(&album, "first", "mp3");
+    let second = audio_file(&album, "second", "flac");
+    let sink = FakeOutputSink::new(44_100, 2);
+    let player = Player::open(temp.path().join("library.db"), sink.clone()).unwrap();
+    player
+        .play_entries(vec![entry(first.clone(), "First"), entry(second.clone(), "Second")], &first)
+        .unwrap();
+    player.set_repeat(RepeatMode::All);
+    // Walk to the last entry.
+    for _ in 0..40 {
+        sink.pull(1_000);
+        if player.snapshot().current_index == Some(1) {
+            break;
+        }
+    }
+    assert_eq!(player.snapshot().current_index, Some(1));
+
+    // The last entry ending must wrap to the first.
+    let mut wrapped = false;
+    for _ in 0..60 {
+        sink.pull(1_000);
+        let snapshot = player.snapshot();
+        if snapshot.current_index == Some(0) {
+            wrapped = true;
+            break;
+        }
+    }
+    let after = player.snapshot();
+    assert!(wrapped, "Repeat All must wrap the last entry back to the first");
+    assert_eq!(after.current_index, Some(0));
+    assert!(after.playing);
+}
+
+#[test]
+fn repeat_off_stops_after_the_last_entry_and_leaves_the_queue_in_place() {
+    let temp = TempDir::new().unwrap();
+    let album = temp.path().join("Album");
+    let first = audio_file(&album, "first", "mp3");
+    let second = audio_file(&album, "second", "flac");
+    let sink = FakeOutputSink::new(44_100, 2);
+    let player = Player::open(temp.path().join("library.db"), sink.clone()).unwrap();
+    player
+        .play_entries(vec![entry(first.clone(), "First"), entry(second.clone(), "Second")], &first)
+        .unwrap();
+    player.set_repeat(RepeatMode::Off);
+
+    let mut ended = false;
+    for _ in 0..80 {
+        sink.pull(1_000);
+        if !player.snapshot().playing {
+            ended = true;
+            break;
+        }
+    }
+    let after = player.snapshot();
+    assert!(ended, "Repeat Off must stop the queue once it reaches the end");
+    assert!(!after.playing);
+    assert_eq!(after.current_index, None);
+    assert_eq!(paths(&after.queue), vec![first, second], "the queue is left in place");
+}
+
+#[test]
+fn play_after_the_queue_has_ended_starts_the_queue_from_the_top() {
+    let temp = TempDir::new().unwrap();
+    let album = temp.path().join("Album");
+    let first = audio_file(&album, "first", "mp3");
+    let second = audio_file(&album, "second", "flac");
+    let sink = FakeOutputSink::new(44_100, 2);
+    let player = Player::open(temp.path().join("library.db"), sink.clone()).unwrap();
+    player
+        .play_entries(vec![entry(first.clone(), "First"), entry(second.clone(), "Second")], &first)
+        .unwrap();
+
+    // Walk until the queue ends under the default Repeat Off.
+    for _ in 0..80 {
+        sink.pull(1_000);
+        if !player.snapshot().playing {
+            break;
+        }
+    }
+    assert!(!player.snapshot().playing);
+
+    let resumed = player.play();
+    assert_eq!(resumed.current_index, Some(0));
+    assert!(resumed.playing);
+    assert_eq!(paths(&resumed.queue), vec![first, second]);
+}
+
+#[test]
+fn previous_restarts_the_current_entry_after_a_few_seconds_have_played() {
+    let temp = TempDir::new().unwrap();
+    let album = temp.path().join("Album");
+    let first = audio_file(&album, "first", "mp3");
+    let second = audio_file(&album, "second", "flac");
+    let sink = FakeOutputSink::new(44_100, 2);
+    let player = Player::open(temp.path().join("library.db"), sink.clone()).unwrap();
+    player
+        .play_entries(vec![entry(first.clone(), "First"), entry(second.clone(), "Second")], &first)
+        .unwrap();
+    // Bring the restart threshold well within the short fixture so the test
+    // can cross it without playing for real seconds.
+    player.set_previous_restart_threshold_for_testing(10);
+    sink.pull(200);
+
+    let after = player.previous();
+    assert_eq!(
+        after.current_index,
+        Some(0),
+        "Previous past the threshold restarts the current entry rather than skipping back"
+    );
+    assert!(after.playing);
+}
+
+#[test]
+fn previous_goes_to_the_prior_entry_when_within_the_threshold() {
+    let temp = TempDir::new().unwrap();
+    let album = temp.path().join("Album");
+    let first = audio_file(&album, "first", "mp3");
+    let second = audio_file(&album, "second", "flac");
+    let sink = FakeOutputSink::new(44_100, 2);
+    let player = Player::open(temp.path().join("library.db"), sink.clone()).unwrap();
+    player
+        .play_entries(vec![entry(first.clone(), "First"), entry(second.clone(), "Second")], &first)
+        .unwrap();
+    for _ in 0..40 {
+        sink.pull(1_000);
+        if player.snapshot().current_index == Some(1) {
+            break;
+        }
+    }
+    assert_eq!(player.snapshot().current_index, Some(1));
+
+    let after = player.previous();
+    assert_eq!(after.current_index, Some(0));
+    assert!(after.playing);
+}
+
+#[test]
+fn previous_at_the_head_restarts_the_first_entry() {
+    let temp = TempDir::new().unwrap();
+    let album = temp.path().join("Album");
+    let first = audio_file(&album, "first", "mp3");
+    let second = audio_file(&album, "second", "flac");
+    let sink = FakeOutputSink::new(44_100, 2);
+    let player = Player::open(temp.path().join("library.db"), sink.clone()).unwrap();
+    player
+        .play_entries(vec![entry(first.clone(), "First"), entry(second.clone(), "Second")], &first)
+        .unwrap();
+    assert_eq!(player.snapshot().current_index, Some(0));
+
+    let after = player.previous();
+    assert_eq!(after.current_index, Some(0));
+    assert!(after.playing);
+}

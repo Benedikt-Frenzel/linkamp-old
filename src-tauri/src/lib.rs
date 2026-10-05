@@ -9,7 +9,7 @@ use std::time::Duration;
 use library::{AlbumCover, LibraryIndex, LibrarySnapshot, Track};
 use notify::event::ModifyKind;
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use player::{Player, PlayerSnapshot, QueueEntry};
+use player::{Player, PlayerSnapshot, QueueEntry, RepeatMode};
 use serde::{Deserialize, Serialize};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -334,6 +334,22 @@ fn player_previous(player: State<'_, Arc<Player>>) -> PlayerSnapshot {
     player.previous()
 }
 
+#[tauri::command]
+fn player_set_shuffle(
+    player: State<'_, Arc<Player>>,
+    on: bool,
+) -> Result<PlayerSnapshot, String> {
+    Ok(player.set_shuffle(on))
+}
+
+#[tauri::command]
+fn player_set_repeat(
+    player: State<'_, Arc<Player>>,
+    mode: RepeatMode,
+) -> Result<PlayerSnapshot, String> {
+    Ok(player.set_repeat(mode))
+}
+
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_window_state::Builder::default().build())
@@ -362,7 +378,9 @@ pub fn run() {
             player_pause,
             player_toggle,
             player_next,
-            player_previous
+            player_previous,
+            player_set_shuffle,
+            player_set_repeat
         ])
         .setup(|app| {
             let data_directory = app.path().app_data_dir()?;
