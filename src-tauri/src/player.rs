@@ -90,7 +90,7 @@ impl Default for RepeatMode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlayerSnapshot {
     pub queue: Vec<QueueEntry>,
@@ -101,6 +101,10 @@ pub struct PlayerSnapshot {
     /// Elapsed time inside the current entry. It advances only while samples
     /// reach the sink, so a pause freezes it, and it restarts with each track.
     pub position_ms: u64,
+    /// The app volume as a linear multiplier, 0.0 to 1.0. It is applied to
+    /// the samples of Linkamp's own stream and never touches the system
+    /// volume; zero writes silence while the stream stays open.
+    pub volume: f32,
 }
 
 impl Default for PlayerSnapshot {
@@ -112,9 +116,17 @@ impl Default for PlayerSnapshot {
             shuffle: false,
             repeat: RepeatMode::Off,
             position_ms: 0,
+            volume: DEFAULT_VOLUME,
         }
     }
 }
+
+/// The volume a fresh player starts with, before any persisted state exists.
+const DEFAULT_VOLUME: f32 = 0.8;
+
+/// How often plain playback (no state change) emits a position snapshot to the
+/// window: a few times per second, never per buffer.
+const POSITION_EVENT_INTERVAL_MS: u64 = 250;
 
 /// Seconds of the next queue entry kept decoded and converted to the stream
 /// format, so a track transition never waits on the disk or a decoder. Bounded
@@ -380,6 +392,15 @@ impl Core {
             cursor += wrote;
         }
 
+        // The app volume is a per-sample multiplier on the mixed stream, on
+        // top of whatever PipeWire and the system volume do with it. Zero
+        // writes silence into the still-open stream, so unmuting is instant.
+        if self.state.volume != 1.0 {
+            for sample in output.iter_mut() {
+                *sample *= self.state.volume;
+            }
+        }
+
         // Top up decode-ahead while the current track plays, so the next entry
         // is decoded before it is needed. Paused rendering returns above and
         // leaves both decoders untouched, which makes resume sample-exact.
@@ -457,12 +478,27 @@ impl Player {
         let event_handler: Arc<Mutex<Option<EventHandler>>> = Arc::new(Mutex::new(None));
         let render_core = Arc::clone(&core);
         let render_events = Arc::clone(&event_handler);
+        // The last position the window was told about by this callback, so
+        // plain playback emits a position snapshot a few times per second
+        // instead of only on state changes.
+        let mut last_reported_position_ms = 0_u64;
         let output = Box::new(sink).start(Box::new(move |samples| {
             let snapshot = {
                 let mut core = render_core
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
-                core.render(samples).then(|| core.snapshot())
+                let changed = core.render(samples);
+                let snapshot = core.snapshot();
+                let position_moved = snapshot
+                    .position_ms
+                    .abs_diff(last_reported_position_ms)
+                    >= POSITION_EVENT_INTERVAL_MS;
+                if changed || (snapshot.playing && position_moved) {
+                    last_reported_position_ms = snapshot.position_ms;
+                    Some(snapshot)
+                } else {
+                    None
+                }
             };
             if let Some(snapshot) = snapshot {
                 emit_to(&render_events, snapshot);
@@ -686,6 +722,19 @@ impl Player {
         let snapshot = {
             let mut core = self.core.lock().unwrap_or_else(|error| error.into_inner());
             core.state.repeat = mode;
+            core.snapshot()
+        };
+        self.emit(snapshot.clone());
+        snapshot
+    }
+
+    /// Sets the app volume, a linear multiplier clamped to 0.0..=1.0. It
+    /// scales only the samples of Linkamp's own stream, never the system
+    /// volume, and zero keeps the stream open on silence.
+    pub fn set_volume(&self, volume: f32) -> PlayerSnapshot {
+        let snapshot = {
+            let mut core = self.core.lock().unwrap_or_else(|error| error.into_inner());
+            core.state.volume = volume.clamp(0.0, 1.0);
             core.snapshot()
         };
         self.emit(snapshot.clone());
