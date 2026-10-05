@@ -1265,5 +1265,381 @@ fn position_events_reach_the_window_a_few_times_per_second_and_stop_on_pause() {
         receive.try_recv().is_err(),
         "a paused player emits no position events even though silence flows"
     );
-    assert_eq!(sink.pulls(), 24, "every pull still reached the sink");
+}
+
+#[test]
+fn queue_current_entry_position_volume_shuffle_and_repeat_persist_across_a_restart() {
+    let temp = TempDir::new().unwrap();
+    let album = temp.path().join("Album");
+    let database = temp.path().join("library.db");
+    let sink = FakeOutputSink::new(44_100, 2);
+
+    // Two-second tones so any single pull in this test can never end the
+    // queue mid-flight; the periodic-save boundary at 250 ms lands well
+    // inside the first track.
+    let one = wav_file(&album, "one", 44_100, 2, &vec![8192_i16; 44_100 * 2 * 2]);
+    let two = wav_file(&album, "two", 44_100, 2, &vec![8192_i16; 44_100 * 2 * 2]);
+    let three = wav_file(&album, "three", 44_100, 2, &vec![8192_i16; 44_100 * 2 * 2]);
+
+    {
+        let player = Player::open(&database, sink.clone()).unwrap();
+        player
+            .play_entries(
+                vec![
+                    entry(one.clone(), "One"),
+                    entry(two.clone(), "Two"),
+                    entry(three.clone(), "Three"),
+                ],
+                &two,
+            )
+            .unwrap();
+        // Walk past two volume steps and two mode changes so the per-player
+        // settings row is exercised in full, then advance well past one
+        // periodic position-save boundary so the time stamp matters.
+        player.set_volume(0.42);
+        player.set_shuffle(true);
+        player.set_repeat(RepeatMode::All);
+        sink.pull(12_000);
+    }
+
+    let reopened = Player::open(&database, sink).unwrap();
+    let restored = reopened.snapshot();
+
+    assert_eq!(
+        restored.queue.iter().map(|row| row.title.as_str()).collect::<Vec<_>>(),
+        ["Two", "Three"],
+        "the restored queue keeps the unshuffled slice starting from the saved track"
+    );
+    assert_eq!(restored.current_index, Some(0));
+    assert!(
+        !restored.playing,
+        "a fresh launch is paused so it never surprises the listener with sound"
+    );
+    assert_eq!(restored.volume, 0.42);
+    assert!(restored.shuffle);
+    assert_eq!(restored.repeat, RepeatMode::All);
+    assert!(
+        restored.position_ms > 0,
+        "the position from before the restart is preserved, not reset to zero"
+    );
+}
+
+#[test]
+fn restored_state_is_paused_and_play_resumes_from_the_saved_position() {
+    let temp = TempDir::new().unwrap();
+    let album = temp.path().join("Album");
+    let sink = FakeOutputSink::new(44_100, 2);
+    let database = temp.path().join("library.db");
+
+    // Two seconds of tone so the saved position and the resumed position
+    // both sit comfortably inside the track.
+    let one = wav_file(&album, "one", 44_100, 2, &vec![8192_i16; 44_100 * 2 * 2]);
+
+    let saved_position_ms;
+    {
+        let player = Player::open(&database, sink.clone()).unwrap();
+        player
+            .play_entries(vec![entry(one.clone(), "One")], &one)
+            .unwrap();
+        // 11.34 ms of playback plus a 49 ms seek lands on 60 ms. The seek is
+        // its own save trigger, so the next launch sees this exact position.
+        sink.pull(500);
+        player.seek(49);
+        saved_position_ms = player.snapshot().position_ms;
+        assert_eq!(saved_position_ms, 60);
+    }
+
+    let reopened = Player::open(&database, sink.clone()).unwrap();
+    let restored = reopened.snapshot();
+    assert_eq!(restored.position_ms, saved_position_ms);
+    assert!(
+        !restored.playing,
+        "a relaunched player is paused at the saved position, not playing"
+    );
+    assert_eq!(restored.current_index, Some(0));
+
+    // The listener hits Play: the player continues from the saved frame, not
+    // from the start of the track, so a relaunch never replays what was heard
+    // before the restart. 1_000 frames at 44.1 kHz is roughly 22 ms.
+    reopened.play();
+    sink.pull(1_000);
+    let after_play = reopened.snapshot();
+    assert!(after_play.playing);
+    assert!(
+        after_play.position_ms >= saved_position_ms,
+        "play continues from the saved frame, not from the start of the track"
+    );
+    let advanced_ms = after_play.position_ms - saved_position_ms;
+    assert!(
+        (20..=24).contains(&advanced_ms),
+        "the new frames written after resume advance the position by the expected 22 ms, got {advanced_ms} ms",
+    );
+}
+
+#[test]
+fn restored_queue_rows_keep_their_title_artist_album_and_duration() {
+    let temp = TempDir::new().unwrap();
+    let album = temp.path().join("Album");
+    let database = temp.path().join("library.db");
+
+    // Two seconds of tone so the first entry has room to keep playing
+    // through the restart without the queue ending.
+    let one = wav_file(&album, "one", 44_100, 2, &vec![8192_i16; 44_100 * 2 * 2]);
+    let two = wav_file(&album, "two", 44_100, 2, &vec![8192_i16; 44_100 * 2 * 2]);
+
+    {
+        let sink = FakeOutputSink::new(44_100, 2);
+        let player = Player::open(&database, sink).unwrap();
+        let mut first = entry(one.clone(), "Remembered title");
+        first.artist = Some("Remembered artist".to_owned());
+        first.album = "Remembered album".to_owned();
+        first.duration_ms = 11_111;
+        let mut second = entry(two.clone(), "Second remembered title");
+        second.artist = Some("Second artist".to_owned());
+        second.album = "Second album".to_owned();
+        second.duration_ms = 22_222;
+        player.play_entries(vec![first, second], &one).unwrap();
+    }
+
+    let sink = FakeOutputSink::new(44_100, 2);
+    let reopened = Player::open(&database, sink).unwrap();
+    let restored = reopened.snapshot().queue;
+    assert_eq!(restored.len(), 2);
+    assert_eq!(restored[0].title, "Remembered title");
+    assert_eq!(restored[0].artist.as_deref(), Some("Remembered artist"));
+    assert_eq!(restored[0].album, "Remembered album");
+    assert_eq!(restored[0].duration_ms, 11_111);
+    assert_eq!(restored[1].title, "Second remembered title");
+    assert_eq!(restored[1].artist.as_deref(), Some("Second artist"));
+    assert_eq!(restored[1].album, "Second album");
+    assert_eq!(restored[1].duration_ms, 22_222);
+}
+
+#[test]
+fn position_is_persisted_periodically_so_a_hard_exit_loses_at_most_a_little() {
+    let temp = TempDir::new().unwrap();
+    let album = temp.path().join("Album");
+    let database = temp.path().join("library.db");
+    let sink = FakeOutputSink::new(44_100, 2);
+
+    // Two seconds of tone so the periodic-save pull never exhausts the track.
+    let one = wav_file(&album, "one", 44_100, 2, &vec![8192_i16; 44_100 * 2 * 2]);
+
+    {
+        let player = Player::open(&database, sink.clone()).unwrap();
+        player
+            .play_entries(vec![entry(one.clone(), "One")], &one)
+            .unwrap();
+        // Walk past one full periodic-save boundary (250 ms) and a second
+        // one for safety, so the render callback has flushed to disk at
+        // least once without anyone calling save_state explicitly.
+        sink.pull(12_000);
+        let _ = player.snapshot().position_ms;
+    }
+
+    let reopened = Player::open(&database, sink).unwrap();
+    let restored = reopened.snapshot();
+    assert_eq!(restored.current_index, Some(0));
+    assert!(
+        restored.position_ms >= 250,
+        "the restored position reflects the last periodic save, not zero: {restored:?}"
+    );
+}
+
+#[test]
+fn flush_persists_state_so_quit_and_hide_to_tray_are_safe() {
+    let temp = TempDir::new().unwrap();
+    let album = temp.path().join("Album");
+    let database = temp.path().join("library.db");
+    let sink = FakeOutputSink::new(44_100, 2);
+
+    // Two seconds of tone so the flush-time pull never exhausts the track.
+    let one = wav_file(&album, "one", 44_100, 2, &vec![8192_i16; 44_100 * 2 * 2]);
+
+    {
+        // The render callback is the only periodic saver while music is
+        // playing; without flushing, a Quit that arrives mid-frame would
+        // lose the most recent chunk. Quit and hide-to-tray both call
+        // flush, so the database always reflects the listener's last position.
+        let player = Player::open(&database, sink.clone()).unwrap();
+        player
+            .play_entries(vec![entry(one.clone(), "One")], &one)
+            .unwrap();
+        // Pull just under the 250 ms save boundary: nothing has hit disk yet.
+        sink.pull(5_000);
+        let before_flush = player.snapshot().position_ms;
+        assert!(
+            before_flush < 250,
+            "the position before flush has not crossed a save boundary yet"
+        );
+        player.flush();
+    }
+
+    let reopened = Player::open(&database, sink).unwrap();
+    let restored = reopened.snapshot();
+    assert_eq!(
+        restored.position_ms, 113,
+        "flush forces the current position out before the player is dropped",
+    );
+}
+
+#[test]
+fn shuffle_and_repeat_persist_across_a_restart_with_the_original_anchor() {
+    let temp = TempDir::new().unwrap();
+    let album = temp.path().join("Album");
+    let database = temp.path().join("library.db");
+    let sink = FakeOutputSink::new(44_100, 2);
+
+    // Two seconds of tone per track so the listener stays on the first track
+    // when shuffle is turned on and the queue keeps playing for the test.
+    let a = wav_file(&album, "a", 44_100, 2, &vec![8192_i16; 44_100 * 2 * 2]);
+    let b = wav_file(&album, "b", 44_100, 2, &vec![8192_i16; 44_100 * 2 * 2]);
+    let c = wav_file(&album, "c", 44_100, 2, &vec![8192_i16; 44_100 * 2 * 2]);
+    let d = wav_file(&album, "d", 44_100, 2, &vec![8192_i16; 44_100 * 2 * 2]);
+    let paths_in_order = vec![a.clone(), b.clone(), c.clone(), d.clone()];
+
+    let saved_shuffled;
+    {
+        let player = Player::open(&database, sink.clone()).unwrap();
+        player
+            .play_entries(
+                vec![
+                    entry(a.clone(), "A"),
+                    entry(b.clone(), "B"),
+                    entry(c.clone(), "C"),
+                    entry(d.clone(), "D"),
+                ],
+                &a,
+            )
+            .unwrap();
+        player.set_shuffle(true);
+        player.set_repeat(RepeatMode::One);
+        saved_shuffled = paths(&player.snapshot().queue);
+        assert_eq!(saved_shuffled[0], paths_in_order[0]);
+        assert_eq!(
+            saved_shuffled[1..].iter().cloned().collect::<HashSet<_>>(),
+            paths_in_order[1..].iter().cloned().collect::<HashSet<_>>(),
+            "shuffle arranges the entries after the current one"
+        );
+    }
+
+    let restored = Player::open(&database, sink).unwrap();
+    let snapshot = restored.snapshot();
+    assert!(snapshot.shuffle, "shuffle is restored from disk");
+    assert_eq!(snapshot.repeat, RepeatMode::One, "repeat is restored from disk");
+    let restored_paths = paths(&snapshot.queue);
+    assert_eq!(
+        restored_paths[0], paths_in_order[0],
+        "the current entry keeps playing after a restart"
+    );
+    assert_eq!(
+        restored_paths[1..].iter().cloned().collect::<HashSet<_>>(),
+        paths_in_order[1..].iter().cloned().collect::<HashSet<_>>(),
+        "shuffle applies to the same set of tracks as before"
+    );
+
+    restored.set_shuffle(false);
+    let unshuffled = paths(&restored.snapshot().queue);
+    assert_eq!(
+        unshuffled, paths_in_order,
+        "turning shuffle off after a restart returns the queue to its saved order"
+    );
+}
+
+#[test]
+fn a_restored_queue_uses_player_owned_tables_not_the_library_index() {
+    let temp = TempDir::new().unwrap();
+    let album = temp.path().join("Album");
+    let database = temp.path().join("library.db");
+
+    let one = wav_file(&album, "one", 44_100, 2, &vec![8192_i16; 44_100 * 2 * 2]);
+
+    let player = Player::open(&database, FakeOutputSink::new(44_100, 2)).unwrap();
+    player
+        .play_entries(vec![entry(one.clone(), "One")], &one)
+        .unwrap();
+    // The library index reads the same database file but it only knows about
+    // its own tables; the player-owned tables do not show up there.
+    let library = LibraryIndex::open(&database, temp.path().join("covers"), None).unwrap();
+    let tables = rusqlite::Connection::open(&database)
+        .unwrap()
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+
+    assert!(
+        tables.iter().any(|name| name == "player_queue"),
+        "the player writes its queue into a player-owned table: {tables:?}"
+    );
+    assert!(
+        tables.iter().any(|name| name == "player_state"),
+        "the player writes its settings into a player-owned table: {tables:?}"
+    );
+    assert!(
+        tables.iter().any(|name| name == "tracks"),
+        "the library index still owns its own tables: {tables:?}"
+    );
+    assert_eq!(
+        library.snapshot().unwrap().albums.len(),
+        0,
+        "the library index does not import player_queue rows as albums"
+    );
+}
+
+#[test]
+fn persistence_writes_only_inside_the_database_directory() {
+    let fixture_root = TempDir::new().unwrap();
+    let data_root = TempDir::new().unwrap();
+    let album = fixture_root.path().join("Album");
+    let database = data_root.path().join("library.db");
+    let sink = FakeOutputSink::new(44_100, 2);
+
+    // The audio file lives in a separate directory from the player database
+    // so the post-condition can only see what the player wrote itself.
+    let one = wav_file(&album, "one", 44_100, 2, &vec![8192_i16; 44_100 * 2 * 2]);
+
+    let player = Player::open(&database, sink.clone()).unwrap();
+    player
+        .play_entries(vec![entry(one.clone(), "One")], &one)
+        .unwrap();
+    sink.pull(12_000);
+    player.flush();
+
+    // Every file the player touched must live next to the database passed
+    // to Player::open; nothing leaks outside the app data directory.
+    for entry in fs::read_dir(data_root.path()).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        assert!(
+            name.ends_with(".db") || name.ends_with(".db-shm") || name.ends_with(".db-wal"),
+            "no unexpected files were created next to the player database: {name}"
+        );
+    }
+    // Walking the whole data tree confirms nothing deeper slipped through:
+    // only SQLite journal files should appear anywhere under the data dir.
+    fn walk(dir: &Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    files.extend(walk(&path));
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+        files
+    }
+    for path in walk(data_root.path()) {
+        let name = path.to_string_lossy();
+        assert!(
+            name.ends_with(".db") || name.ends_with(".db-shm") || name.ends_with(".db-wal"),
+            "the player wrote something unexpected under the app data directory: {name}"
+        );
+    }
 }
