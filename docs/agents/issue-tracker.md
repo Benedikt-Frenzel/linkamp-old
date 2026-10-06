@@ -1,30 +1,29 @@
-# Issue tracker: Local Markdown
+# Issue tracker: GitHub Issues
 
-Issues and specs for this repo live as markdown files in `.scratch/`.
+Issues and specs for this repo live as GitHub Issues in `Benedikt-Frenzel/linkamp`, managed with `gh`.
 
 ## Conventions
 
-- One feature per directory: `.scratch/<feature-slug>/`
-- The spec is `.scratch/<feature-slug>/spec.md`
-- Implementation issues are one file per ticket at `.scratch/<feature-slug>/issues/<NN>-<slug>.md`, numbered from `01`, never a single combined tickets file
-- Triage state is recorded as a `Status:` line near the top of each issue file (see `triage-labels.md` for the role strings)
-- Comments and conversation history append to the bottom of the file under a `## Comments` heading
+- One label per feature area is NOT used; the feature is named in the issue title: `Spec: <feature>`, `<Feature> NN: <ticket title>`.
+- The spec issue body carries Problem Statement, Solution, User Stories, Implementation Decisions, Testing Decisions, Out of Scope, and Further Notes.
+- Implementation tickets reference their feature by title prefix and number, e.g. `Playback 03: …`. A `Blocked by` section lists the gating tickets by number and title.
+- Acceptance criteria are GitHub task lists; comments and conversation history append as issue comments.
+- Triage state is a label (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`), matching `triage-labels.md`.
 
 ## When a skill says "publish to the issue tracker"
 
-Create a new file under `.scratch/<feature-slug>/` (creating the directory if needed).
+Create a GitHub issue with `gh issue create -R Benedikt-Frenzel/linkamp`.
 
 ## When a skill says "fetch the relevant ticket"
 
-Read the file at the referenced path. The user will normally pass the path or the issue number directly.
+Read the issue with `gh issue view <number> -R Benedikt-Frenzel/linkamp --comments`. The user will normally pass the number or URL directly.
 
 ## Wayfinding operations
 
-Used by `/wayfinder`. The **map** is a file with one **child** file per ticket.
+Used by `/wayfinder`. The **map** is an open issue; **child tickets** are issues referencing it.
 
-- **Map**: `.scratch/<effort>/map.md` (the Notes / Decisions-so-far / Fog body).
-- **Child ticket**: `.scratch/<effort>/issues/NN-<slug>.md`, numbered from `01`, with the question in the body. A `Type:` line records the ticket type (`research`/`prototype`/`grilling`/`task`); a `Status:` line records `claimed`/`resolved`.
-- **Blocking**: a `Blocked by: NN, NN` line near the top. A ticket is unblocked when every file it lists is `resolved`.
-- **Frontier**: scan `.scratch/<effort>/issues/` for files that are open, unblocked, and unclaimed; first by number wins.
-- **Claim**: set `Status: claimed` and save before any work.
-- **Resolve**: append the answer under an `## Answer` heading, set `Status: resolved`, then append a context pointer (gist + link) to the map's Decisions-so-far in `map.md`.
+- **Map**: an open issue titled `<effort> map`, body sections Notes / Decisions-so-far / Fog.
+- **Child ticket**: an issue referencing the map, with a `Type:` line (`research`/`prototype`/`grilling`/`task`) and a `Status:` line (`claimed`/`resolved`) in the body. A `Blocked by: NN, NN` line lists gating tickets.
+- **Frontier**: `gh issue list -R Benedikt-Frenzel/linkamp --state open`, first by number wins among unblocked, unclaimed.
+- **Claim**: edit the body to `Status: claimed` and save before any work.
+- **Resolve**: comment the answer under the issue, set `Status: resolved`, and append a context pointer to the map issue's Decisions-so-far.

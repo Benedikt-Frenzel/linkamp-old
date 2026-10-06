@@ -2,7 +2,7 @@
 
 ### Issue tracker
 
-Issues and specs live as markdown files under `.scratch/<feature-slug>/`. See `docs/agents/issue-tracker.md`.
+Issues and specs live as GitHub Issues in `Benedikt-Frenzel/linkamp`, managed with `gh`. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
